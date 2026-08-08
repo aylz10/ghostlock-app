@@ -42,6 +42,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -74,14 +75,86 @@ public class MainActivity extends Activity {
      * Mirrors the offset tables under src/kernels: only these uname builds are supported.
      */
     private static boolean isKernelSupported() {
-        String version = System.getProperty("os.version", "");
-        for (String supported : SupportedKernels.UNAMES) {
-            if (supported.equals(version)) {
-                return true;
-            }
+        String model = getSystemProperty("ro.build.product");
+        if (model.isEmpty()) {
+            model = getSystemProperty("ro.vivo.oem.model");
         }
-        return false;
+        if (model.isEmpty()) {
+            model = getSystemProperty("ro.product.name");
+        }
+        String version = getSystemProperty("ro.build.version.oplusrom.display");
+        String key = model + "_" + version;
+
+        switch (key) {
+            // PKR110 OnePlus Ace 5 Pro
+            case "PKR110_15.0":
+            case "PKR110_16.0.3":
+            case "PKR110_16.0.5":
+            case "PKR110_16.0.7":
+            case "PKR110_16.0.8":
+            case "PKR110_16.0.9":
+            // PKJ110 Oppo Find X8 Ultra
+            case "PKJ110_16.0.3":
+            case "PKJ110_16.0.5":
+            case "PKJ110_16.0.7":
+            case "PKJ110_16.0.8":
+            case "PKJ110_16.0.9":
+            // PKU110 Oppo Find X8 Ultra Satellite Edition
+            case "PKU110_16.0.3":
+            case "PKU110_16.0.5":
+            case "PKU110_16.0.7":
+            case "PKU110_16.0.8":
+            case "PKU110_16.0.9":
+            // PKX110 OnePlus 13T
+            case "PKX110_16.0.3":
+            case "PKX110_16.0.5":
+            case "PKX110_16.0.7":
+            case "PKX110_16.0.8":
+            case "PKX110_16.0.9":
+            // PJZ110 OnePlus 13
+            case "PJZ110_16.0.2":
+            case "PJZ110_16.0.3":
+            case "PJZ110_16.0.5":
+            case "PJZ110_16.0.7":
+            case "PJZ110_16.0.8":
+            case "PJZ110_16.0.9":
+            // OPD2409 Oppo Pad 4 Pro
+            case "OPD2409_16.0.1":
+            case "OPD2409_16.0.8":
+            case "OPD2409_16.0.9":
+            // OPD2413 OnePlus Pad 2 Pro
+            case "OPD2413_16.0.9":
+            // RMX6699 Realme GT 8
+            case "RMX6699_16.0.8":
+            // PLU110 OnePlus Turbo 6
+            case "PLU110_16.0.8":
+            case "PLU110_16.0.9":
+            // PLE110 Oppo K13 Turbo Pro
+            case "PLE110_16.0.8":
+            case "PLE110_16.0.9":
+            // PLQ110 OnePlus Ace 6
+            case "PLQ110_16.0.0":
+            case "PLQ110_16.0.9":
+            // TB322FC_PRC Lenovo Legion Y700 (Gen 4)
+            case "TB322FC_PRC_1.5.10.229":
+            // PKG110 OnePlus Ace 5
+            case "PKG110_16.0.9":
+            // PMA110 Oppo Find X9 Ultra
+            case "PMA110_16.0.9":
+            // PKH110 Oppo Find N5
+            case "PKH110_16.0.7":
+            case "PKH110_16.0.8":
+            case "PKH110_16.0.9":
+            // PKH120 Oppo Find N5 Satellite Edition
+            case "PKH120_16.0.7":
+            case "PKH120_16.0.8":
+            case "PKH120_16.0.9":
+                return true;
+            default:
+                return false;
+        }
     }
+
 
     /**
      * Returns the value when it looks like a real device name, else null.
@@ -259,7 +332,20 @@ public class MainActivity extends Activity {
     private String resolveDeviceName() {
         boolean cn = "CN".equalsIgnoreCase(Locale.getDefault().getCountry());
         String marketName = firstValidProperty(cn ? "ro.vendor.oplus.market.name" : "ro.vendor.oplus.market.enname", cn ? "ro.vendor.oplus.market.enname" : "ro.vendor.oplus.market.name", "ro.product.marketname");
-        return marketName != null ? marketName : Build.MANUFACTURER + " " + Build.MODEL;
+        String name = marketName != null ? marketName : Build.MANUFACTURER + " " + Build.MODEL;
+
+        // 显示 isKernelSupported 中使用的 model + "_" + version
+        String model = getSystemProperty("ro.build.product");
+        if (model.isEmpty()) {
+            model = getSystemProperty("ro.vivo.oem.model");
+        }
+        if (model.isEmpty()) {
+            model = getSystemProperty("ro.product.name");
+        }
+        String version = getSystemProperty("ro.build.version.oplusrom.display");
+        String targetKey = model + "_" + version;
+
+        return name + "  (" + targetKey + ")";
     }
 
     private void startExploit() {
@@ -273,12 +359,12 @@ public class MainActivity extends Activity {
             try {
                 File workDir = getFilesDir();
                 File binary = resolveBinary();
-                File ksud = prepareKsud(workDir);
+                /* File ksud = prepareKsud(workDir);
                 if (ksud != null) {
                     appendLog("ksud ready");
                 } else {
                     appendLog("warning: ksud not found");
-                }
+                } */
                 code = runBinary(binary, workDir);
                 appendLog("exit code=" + code);
             } catch (Throwable t) {
@@ -349,7 +435,7 @@ public class MainActivity extends Activity {
         File out = new File(workDir, KSUD_NAME);
         List<String> candidates = new ArrayList<>();
         try {
-            ApplicationInfo appInfo = getPackageManager().getApplicationInfo("me.weishu.kernelsu", 0);
+            ApplicationInfo appInfo = getPackageManager().getApplicationInfo("com.resukisu.resukisu", 0);
             candidates.add(new File(appInfo.nativeLibraryDir, "libksud.so").getAbsolutePath());
         } catch (PackageManager.NameNotFoundException ignored) {
             appendLog("KernelSU app not installed");
@@ -379,17 +465,53 @@ public class MainActivity extends Activity {
         return null;
     }
 
-    private int runBinary(File binary, File workDir) throws IOException, InterruptedException {
-        ProcessBuilder pb = new ProcessBuilder(binary.getAbsolutePath());
+    private int runBinary(File binary, File workDir) throws Exception {
+        // 构建环境变量数组
+        List<String> envList = new ArrayList<>();
+        envList.add("LD_PRELOAD=" + binary.getAbsolutePath());
+        envList.add("GHOSTLOCK_HOME=" + workDir.getAbsolutePath());
+        envList.add("TMPDIR=" + workDir.getAbsolutePath());
+        envList.add("HOME=" + workDir.getAbsolutePath());
+        envList.add("DEBUG=0");
+        envList.add("KSU_MANAGER_PACKAGE=com.resukisu.resukisu");
+        String versionEnv = getSystemProperty("ro.build.version.oplusrom.display");
+        envList.add("KSU_TARGET_PROFILE=boot_" + versionEnv);
+
+        // 保留关键的系统环境变量
+        String path = System.getenv("PATH");
+        if (path != null) envList.add("PATH=" + path);
+        String androidRoot = System.getenv("ANDROID_ROOT");
+        if (androidRoot != null) envList.add("ANDROID_ROOT=" + androidRoot);
+        String androidData = System.getenv("ANDROID_DATA");
+        if (androidData != null) envList.add("ANDROID_DATA=" + androidData);
+
+        String[] envp = envList.toArray(new String[0]);
+        String[] argv = {"/system/bin/true"};
+
+        appendLog("forking host process...");
+
+        // 用 ProcessBuilder 直接执行 /system/bin/true（内部就是 fork+execve，不经 sh）
+        ProcessBuilder pb = new ProcessBuilder(argv);
         pb.directory(workDir);
         pb.redirectErrorStream(true);
-        pb.environment().put("GHOSTLOCK_HOME", workDir.getAbsolutePath());
-        pb.environment().put("TMPDIR", workDir.getAbsolutePath());
-        pb.environment().put("HOME", workDir.getAbsolutePath());
+
+        // ProcessBuilder 没有直接设置环境变量数组的方法，
+        // 但可以通过 environment() 逐个 put
+        Map<String, String> env = pb.environment();
+        env.clear();
+        for (String e : envp) {
+            int idx = e.indexOf('=');
+            if (idx > 0) {
+                env.put(e.substring(0, idx), e.substring(idx + 1));
+            }
+        }
 
         Process process = pb.start();
+
+        // 读取输出的逻辑保持不变...
         Thread reader = new Thread(() -> {
-            try (BufferedReader br = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
+            try (BufferedReader br = new BufferedReader(
+                    new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
                 String line;
                 while ((line = br.readLine()) != null) {
                     appendLog(line);
@@ -407,22 +529,11 @@ public class MainActivity extends Activity {
                 process.destroyForcibly();
             }
         }
-        // Drain buffered output, then force-unblock the reader: a late-load
-        // daemon (zygisk) can inherit our pipe and keep it open forever.
-        try {
-            reader.join(3000);
-        } catch (InterruptedException e) {
+
+        try { reader.join(3000); } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
-        try {
-            process.getInputStream().close();
-        } catch (IOException ignored) {
-        }
-        try {
-            reader.join(3000);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+        try { process.getInputStream().close(); } catch (IOException ignored) {}
 
         appendKsudLogTail(workDir);
         return finished ? process.exitValue() : -1;
