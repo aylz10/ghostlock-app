@@ -108,4 +108,75 @@ extern const struct kernel_offsets *active_offsets;
 #define TASK_TASKS_OFF           _RSO(task_tasks, 0x638)
 #define TASK_SECCOMP_OFF         _RSO(task_seccomp, 0x9C8)
 
+/* rt_mutex_waiter: 5.15 uses tree_entry/pi_tree_entry with a shared
+ * prio/deadline pair; 6.x uses tree/pi_tree with split prio/deadline
+ * fields. 0 in the offsets table keeps the target.h 6.x defaults. */
+#undef FAKE_WAITER_TREE_PRIO_OFF
+#undef FAKE_WAITER_TREE_DEADLINE_OFF
+#undef FAKE_WAITER_PI_TREE_ENTRY_OFF
+#undef FAKE_WAITER_PI_TREE_PRIO_OFF
+#undef FAKE_WAITER_PI_TREE_DEADLINE_OFF
+#undef FAKE_WAITER_TASK_OFF
+#undef FAKE_WAITER_LOCK_OFF
+#undef FAKE_WAITER_WAKE_STATE_OFF
+#undef FAKE_WAITER_WW_CTX_OFF
+
+#define FAKE_WAITER_TREE_PRIO_OFF         _RSO(waiter_tree_prio, 0x18)
+#define FAKE_WAITER_TREE_DEADLINE_OFF     _RSO(waiter_tree_deadline, 0x20)
+#define FAKE_WAITER_PI_TREE_ENTRY_OFF     _RSO(waiter_pi_tree, 0x28)
+#define FAKE_WAITER_PI_TREE_PRIO_OFF      _RSO(waiter_pi_tree_prio, 0x40)
+#define FAKE_WAITER_PI_TREE_DEADLINE_OFF  _RSO(waiter_pi_tree_deadline, 0x48)
+#define FAKE_WAITER_TASK_OFF              _RSO(waiter_task, 0x50)
+#define FAKE_WAITER_LOCK_OFF              _RSO(waiter_lock, 0x58)
+#define FAKE_WAITER_WAKE_STATE_OFF        _RSO(waiter_wake_state, 0x60)
+#define FAKE_WAITER_WW_CTX_OFF            _RSO(waiter_ww_ctx, 0x68)
+
+#undef CRED_UID_OFF
+#undef CRED_SECUREBITS_OFF
+#undef CRED_CAPS_OFF
+#undef CRED_SECURITY_OFF
+#define CRED_UID_OFF        _RSO(cred_uid, 8)
+#define CRED_SECUREBITS_OFF _RSO(cred_securebits, 40)
+#define CRED_CAPS_OFF       _RSO(cred_caps, 48)
+#define CRED_SECURITY_OFF   _RSO(cred_security, 128)
+
+/* file_operations: 5.15/6.6/6.12 slot offsets differ (6.12 gained one
+ * pointer before unlocked_ioctl; 5.15 still has the legacy read/write). */
+#undef FOPS_LLSEEK_OFF
+#undef FOPS_READ_OFF
+#undef FOPS_WRITE_OFF
+#undef FOPS_READ_ITER_OFF
+#undef FOPS_WRITE_ITER_OFF
+#undef FOPS_IOCTL_OFF
+#undef FOPS_COMPAT_IOCTL_OFF
+#undef FOPS_MMAP_OFF
+#undef FOPS_OPEN_OFF
+#undef FOPS_RELEASE_OFF
+#undef FOPS_SPLICE_READ_OFF
+#undef FOPS_SHOW_FDINFO_OFF
+#define FOPS_LLSEEK_OFF        _RSO(fops_llseek, 0x08)
+#define FOPS_READ_OFF          _RSO(fops_read, 0x10)
+#define FOPS_WRITE_OFF         _RSO(fops_write, 0x18)
+#define FOPS_READ_ITER_OFF     _RSO(fops_read_iter, 0x20)
+#define FOPS_WRITE_ITER_OFF    _RSO(fops_write_iter, 0x28)
+#define FOPS_IOCTL_OFF         _RSO(fops_ioctl, 0x48)
+#define FOPS_COMPAT_IOCTL_OFF  _RSO(fops_compat_ioctl, 0x50)
+#define FOPS_MMAP_OFF          _RSO(fops_mmap, 0x58)
+#define FOPS_OPEN_OFF          _RSO(fops_open, 0x68)
+#define FOPS_RELEASE_OFF       _RSO(fops_release, 0x78)
+#define FOPS_SPLICE_READ_OFF   _RSO(fops_splice_read, 0xb8)
+#define FOPS_SHOW_FDINFO_OFF   _RSO(fops_show_fdinfo, 0xd8)
+
+/* struct page / mm_struct. */
+#undef STRUCT_PAGE_SIZE
+#undef STRUCT_PAGE_COMPOUND_HEAD_OFF
+#undef STRUCT_SLAB_CACHE_OFF
+#undef STRUCT_PAGE_TYPE_OFF
+#undef MM_STRUCT_SZ
+#define STRUCT_PAGE_SIZE              _RSO(struct_page_size, 0x40)
+#define STRUCT_PAGE_COMPOUND_HEAD_OFF _RSO(struct_page_compound_head, 0x08)
+#define STRUCT_SLAB_CACHE_OFF         _RSO(struct_slab_cache, 0x08)
+#define STRUCT_PAGE_TYPE_OFF          _RSO(struct_page_type, 0x30)
+#define MM_STRUCT_SZ                  _RSO(struct_mm_struct, 0x500)
+
 #endif

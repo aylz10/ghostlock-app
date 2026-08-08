@@ -375,6 +375,7 @@ int try_set_ashmem_name_blob(int fd, const unsigned char *blob, size_t len) {
 }
 
 pid_t clone_child(void) {
+  log_flush_file();
   pid_t child = SYSCHK(syscall(SYS_clone, SIGCHLD, NULL, NULL, NULL, 0));
   if (child == 0) {
     SYSCHK(prctl(PR_SET_PDEATHSIG, SIGKILL));

@@ -6,8 +6,10 @@
 
 | Kernel                                                 | Devices                                        |
 | ------------------------------------------------------ | ---------------------------------------------- |
+| `5.15.194-android13-8-00019-gf4321180a397-ab15212794`  | Redmi K70                                       |
 | `6.6.77-android15-8-g4a507830d890-ab13636293-4k`       | Redmi K90 (SM8750), Xiaomi Civi 5 Pro (SM8735) |
 | `6.6.77-android15-8-g63ce7556864c-ab13994517-4k`       | Xiaomi 15 (SM8750)                             |
+| `6.6.77-android15-8-gf9a1d4bd8353-abogki440974771-4k`  | Xiaomi 15 (SM8750)                             |
 | `6.6.77-android15-8-gca30f3b4bef6-abogki440974771-4k`  | Xiaomi 15 Pro (SM8750)                         |
 | `6.6.89-android15-8-g096cdb6ecefc-ab14358676-4k`       | OPPO Pad 4 Pro (SM8750)                        |
 | `6.6.118-android15-8-g2e6b9c3812c5-ab15114928-4k`      | OPPO Find N5 (SM8750)                          |

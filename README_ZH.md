@@ -6,8 +6,10 @@
 
 | Kernel                                                 | Devices                                        |
 | ------------------------------------------------------ | ---------------------------------------------- |
+| `5.15.194-android13-8-00019-gf4321180a397-ab15212794`  | Redmi K70                                       |
 | `6.6.77-android15-8-g4a507830d890-ab13636293-4k`       | Redmi K90 (SM8750), Xiaomi Civi 5 Pro (SM8735) |
 | `6.6.77-android15-8-g63ce7556864c-ab13994517-4k`       | Xiaomi 15 (SM8750)                             |
+| `6.6.77-android15-8-gf9a1d4bd8353-abogki440974771-4k`  | Xiaomi 15 (SM8750)                             |
 | `6.6.77-android15-8-gca30f3b4bef6-abogki440974771-4k`  | Xiaomi 15 Pro (SM8750)                         |
 | `6.6.89-android15-8-g096cdb6ecefc-ab14358676-4k`       | OPPO Pad 4 Pro (SM8750)                        |
 | `6.6.118-android15-8-g2e6b9c3812c5-ab15114928-4k`      | OPPO Find N5 (SM8750)                          |
@@ -51,6 +53,17 @@ python tools/extract_target.py `
 `core_sys_select` 只把 3 份 `FDS_BYTES(nfds)` 的 fd_set 拷到内核栈（nfds=320 时为 qword 0..14）。futex waiter 必须落在该区内：其 lock 字段位于 waiter 起始字 + 11，因此推导 shift（waiter 的 qword 偏移）必须 ≤ 3，否则 task/lock 会落入内核清零区，路线不可行。布局不可行时脚本会直接报错。
 
 同一内核版本在不同 SoC 分支的 PGO/LTO 布局可能不同：小米 15（`6.6.77`，`do_pselect` 未内联）的 waiter 位于第 12 个 qword，不可行；小米 15 Pro（同 `6.6.77`，中间层被内联）waiter 位于 word 0，可用 `pselect_waiter_shift=-2`。
+
+### mcast 路线（setsockopt 栈拷贝）
+
+pselect 布局不可行时，`extract_target.py` 会自动推导 IPv6 mcast 路线：`setsockopt(AF_INET6, IPPROTO_IPV6, 46, optval, 264)` 的 `do_ipv6_setsockopt` 会把 264 字节整段拷到内核栈，若该拷贝区能完整覆盖 futex waiter，则把 fake waiter 放进 `optval[mcast_payload_off]`，运行时会走 `do_mcast_fake_lock_route()`（与 pselect 路线共用 consumer/cfi 阶段）。已验证：
+
+- Redmi K70（`5.15.194`）：waiter 位于拷贝区 `+0xa8`，pselect 负重叠不可行。
+- 小米 15（`6.6.77-gf9a1d4bd8353`）：waiter 位于拷贝区 `+0x90`，pselect shift=12 不可行。
+
+两内核的 optname 46 均落在 switch case 45（264 字节拷贝块）。
+
+注意：mcast 路线需要创建 IPv6 socket，App 已声明 `android.permission.INTERNET`；缺少该权限时 HyperOS 会在 `socket()` 处直接返回 `EPERM`（实测 errno=1）。运行时会按口味列表回退尝试多种 socket 创建方式并输出每个 errno 便于排查。
 
 ## 来源与许可证
 

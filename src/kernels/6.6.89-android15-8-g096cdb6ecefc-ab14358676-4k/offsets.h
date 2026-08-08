@@ -30,7 +30,7 @@ OFFSETS_ENTRY(
     .off_ashmem_show_fdinfo = 0x00c7f0e0,
 ),
 
-/* BTF reference (runtime uses target.h defaults): */
+/* BTF reference (STRUCT_OFFSETS_* macros carry per-kernel values): */
 /* #define STRUCT_PAGE_SIZE 0x40 */
 /* #define STRUCT_PAGE_COMPOUND_HEAD 0x8 */
 /* #define STRUCT_PAGE_TYPE 0x30 */

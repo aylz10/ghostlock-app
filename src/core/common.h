@@ -20,6 +20,7 @@
 #include <sched.h>
 #include <signal.h>
 #include <stdatomic.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -152,6 +153,8 @@
 #define PSELECT_TIMEOUT_SEC 0
 #endif
 #define PSELECT_TIMEOUT_USEC 200000
+#define MCAST_ROUTE_OPTNAME 46
+#define MCAST_ROUTE_COPY_LEN 0x108
 #define SLIDE_PSELECT_TIMEOUT_SEC 1
 #define SLIDE_WAIT_SECONDS 2
 #define PSELECT_WRITE_SHAPE_DEFAULT 1
@@ -256,6 +259,17 @@ extern atomic_int consumer_calls;
 extern atomic_int consumer_success;
 extern atomic_int consumer_inflight;
 extern atomic_int main_route_delay_usec;
+extern atomic_int consumer_sched_ret;
+extern atomic_int consumer_sched_errno;
+extern atomic_int consumer_futex_ret;
+extern atomic_int consumer_futex_errno;
+extern atomic_int consumer_futex_locked;
+extern atomic_int consumer_futex_entered;
+extern int punch_mode;
+extern int punch_vary_nice;
+extern int punch_max_calls;
+extern int punch_burst;
+extern int punch_delay_usec;
 extern atomic_int cfi_stage_done;
 extern atomic_int pipe_prepare_request;
 extern atomic_int pipe_prepare_done;
@@ -432,6 +446,8 @@ void open_selected_fds(
     fd_set *in, fd_set *out, fd_set *ex, int read_fd, int write_fd);
 void prepare_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex);
 void do_pselect_fake_lock_route(void);
+void prepare_mcast_payload(unsigned char *payload, size_t len);
+void do_mcast_fake_lock_route(void);
 void reset_main_route_state(void);
 int run_main_route_threads(void);
 

@@ -25,6 +25,20 @@
 #include <android/log.h>
 #endif
 
+/* Real-time console + file logging, implemented in src/core/main.c.
+ * Declared here (before the pr_* macros below) so any translation unit
+ * that includes utils.h can call them. log_line() formats one pr_* line,
+ * writes it to stdout (colored, byte-identical to the old printf macros)
+ * and appends the uncolored line to the log fd opened by init_file_log().
+ * No background thread is used, so every fork() in the exploit stays
+ * single-threaded (a tee thread would race stdio/malloc locks into
+ * forked children and hang the W2/W3 leaf probe). */
+void log_line(const char *color, const char *prefix, const char *fmt, ...);
+void init_file_log(void);
+/* Force the log file to disk (fdatasync); call before fork/clone or any
+ * kernel-corrupting step so the last console lines survive a hang/reboot. */
+void log_flush_file(void);
+
 #ifndef HIDEMINMAX
 #define MAX(X,Y) (((X) > (Y)) ? (X) : (Y))
 #define MIN(X,Y) (((X) < (Y)) ? (X) : (Y))
@@ -113,17 +127,17 @@
     } while (0)
 #else
 #define pr_error(fmt, ...) do { \
-        printf(COLOR_RED "[!] " COLOR_DEFAULT fmt, ##__VA_ARGS__); \
+        log_line(COLOR_RED, "[!] ", fmt, ##__VA_ARGS__); \
         exit(-1); \
     } while (0)
 #define pr_warning(fmt, ...) do { \
-        printf(COLOR_RED "[-] " COLOR_DEFAULT fmt, ##__VA_ARGS__); \
+        log_line(COLOR_RED, "[-] ", fmt, ##__VA_ARGS__); \
     } while (0)
 #define pr_info(fmt, ...) do { \
-        printf(COLOR_YELLOW "[*] " COLOR_DEFAULT fmt, ##__VA_ARGS__); \
+        log_line(COLOR_YELLOW, "[*] ", fmt, ##__VA_ARGS__); \
     } while (0)
 #define pr_success(fmt, ...) do { \
-        printf(COLOR_GREEN "[+] " COLOR_DEFAULT fmt, ##__VA_ARGS__); \
+        log_line(COLOR_GREEN, "[+] ", fmt, ##__VA_ARGS__); \
     } while (0)
 #endif
 #endif
